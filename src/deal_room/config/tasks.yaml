@@ -1,0 +1,45 @@
+analyze_financials:
+  description: >
+    Review the following company description / pitch text and extract every
+    financial signal it contains:
+
+    {company_info}
+
+    Assess burn rate, runway, and unit economics (CAC, LTV, margins, revenue
+    growth) using only what is explicitly stated or can be directly derived
+    from it. Do not invent numbers or assume industry-average figures to fill
+    gaps. If a signal needed for a full assessment (e.g. burn rate, CAC, LTV,
+    churn, funding raised) is missing or ambiguous, explicitly say so instead
+    of guessing.
+
+    You must score data_completeness and confidence independently — they
+    answer different questions and must not influence each other:
+    - data_completeness reflects ONLY what fraction of the required fields
+      (burn rate, runway, CAC, LTV, gross margin, churn) were actually
+      disclosed in the input. This is a measure of the INPUT, not the
+      business. A pitch that discloses all six should score "high" even if
+      those numbers reveal a struggling business. A pitch missing most of
+      them should score "low" regardless of how good the disclosed numbers
+      look.
+    - confidence reflects ONLY your read on the company's financial health
+      based on whatever data was actually available. This is a measure of
+      the BUSINESS, not the input. A complete dataset that reveals a
+      cash-negative business, thin margins, or high churn should score LOW
+      confidence even though data_completeness is high. A sparse dataset
+      gives you little to reason about, so confidence should also be low
+      in that case — but for the different reason that there isn't enough
+      information to judge health either way, not because the data itself
+      is incomplete.
+  expected_output: >
+    A structured assessment with: a burn rate assessment (stated or inferred
+    monthly burn, or a note that it can't be determined); a runway estimate
+    (in months, or a note that it can't be determined given available data);
+    notes on unit economics (CAC, LTV, margins, growth trends, and how they
+    relate); a list of specific red flags found in the pitch (or an empty
+    list if none); a data_completeness level of "high", "medium", or "low"
+    reflecting ONLY what fraction of burn/runway/CAC/LTV/margin/churn data
+    was present in the input; and a confidence level of "high", "medium", or
+    "low" reflecting ONLY the analyst's judgment of financial health based on
+    the available data, independent of data_completeness.
+  agent: financial_analyst
+  output_pydantic: FinancialAssessment
