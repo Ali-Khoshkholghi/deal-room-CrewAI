@@ -43,3 +43,101 @@ analyze_financials:
     the available data, independent of data_completeness.
   agent: financial_analyst
   output_pydantic: FinancialAssessment
+
+analyze_market:
+  description: >
+    Review the following company description / pitch text and assess its
+    market and competitive position:
+
+    {company_info}
+
+    Assess market size (TAM/SAM/SOM if derivable, or note that it isn't),
+    the competitive landscape (named or implied competitors, substitutes,
+    or reasons the space is uncontested), and timing (why now, or why the
+    timing is questionable). Do not accept "blue ocean" or "no competition"
+    claims at face value — if the pitch doesn't name real alternatives,
+    say so as a gap rather than assuming the market truly has none. Do not
+    invent a TAM figure that isn't stated or directly derivable.
+  expected_output: >
+    A structured assessment with: market_size_notes (stated or derivable
+    market sizing, or a note that it can't be determined); competitive_landscape
+    (named/implied competitors and substitutes, or a note that none were
+    disclosed and that's itself a gap); timing_assessment (why now, or why
+    timing is unclear/risky); and a list of specific red flags (or an empty
+    list if none).
+  agent: market_analyst
+  output_pydantic: MarketAssessment
+
+analyze_technical:
+  description: >
+    Review the following company description / pitch text and evaluate the
+    credibility of its technical claims and moat:
+
+    {company_info}
+
+    Identify any technical claims made (proprietary technology, unique
+    architecture, defensibility) and assess whether they're specific enough
+    to be credible or are generic language that could apply to any
+    competitor. If no technical claims are made at all, say so rather than
+    inventing a moat assessment. Do not accept vague claims ("AI-powered,"
+    "proprietary") as evidence of a real moat without specifics backing
+    them up.
+  expected_output: >
+    A structured assessment with: moat_credibility rated "strong",
+    "moderate", "weak", or "unclear" (use "unclear" when the pitch makes no
+    verifiable technical claims one way or another); technical_claims_notes
+    explaining what claims were made and why they were rated that way; and
+    a list of specific red flags (or an empty list if none).
+  agent: technical_diligence_agent
+  output_pydantic: TechnicalAssessment
+
+assess_risk:
+  description: >
+    Review the following company description / pitch text and identify
+    downside risks:
+
+    {company_info}
+
+    Assess regulatory risk (exposure implied by the business model or
+    industry), team risk (gaps in the founding team, missing key roles,
+    single-person dependencies), and market-timing risk (too early, too
+    late, or a closing window). Only list risks that are actually
+    supported by something in the pitch or a well-known characteristic of
+    the industry it operates in — do not fabricate risks with no basis.
+  expected_output: >
+    A structured assessment with: regulatory_risks (list, empty if none
+    identified), team_risks (list, empty if none identified),
+    market_timing_risks (list, empty if none identified), and an
+    overall_risk_level of "low", "medium", or "high" reflecting the
+    combined severity of the risks found.
+  agent: risk_assessor
+  output_pydantic: RiskAssessment
+
+produce_investment_memo:
+  description: >
+    Produce a complete investment memo for the following company:
+
+    {company_info}
+
+    Cover financial health, market position, technical credibility, and
+    risk profile. Delegate to your specialist analysts as needed, and if
+    any specialist's initial answer is too thin or vague, re-query them
+    for more detail before finalizing.
+
+    The `recommendation` field must be exactly one of these three strings,
+    with spaces (not underscores) and no other punctuation or casing
+    changes: 'pursue', 'pass', 'needs more diligence'. For example, write
+    "needs more diligence" — never "needs_more_diligence" or
+    "Needs More Diligence".
+  expected_output: >
+    A structured investment memo with: company_summary (brief neutral
+    description of what the company does); financial_summary (from the
+    financial analyst's findings); market_summary (from the market
+    analyst's findings); technical_summary (from the technical diligence
+    findings); risk_summary (from the risk assessor's findings);
+    key_red_flags (a consolidated list of the most material red flags
+    across all specialist findings); a recommendation that must be exactly
+    one of: 'pursue', 'pass', 'needs more diligence' (with spaces, not
+    underscores); and a confidence level of "high", "medium", or "low" in
+    that recommendation.
+  output_pydantic: InvestmentMemo
