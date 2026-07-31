@@ -1,13 +1,18 @@
 import os
 import threading
+import time
 import uuid
+from pathlib import Path
 
 from crewai import LLM, Agent, Crew, Process, Task
 from crewai.events.event_bus import crewai_event_bus
 from crewai.events.types.agent_events import AgentExecutionCompletedEvent
+from crewai.memory.storage.lancedb_storage import LanceDBStorage
+from crewai.memory.unified_memory import Memory
 from crewai.project import CrewBase, agent, crew, output_pydantic, task
 from dotenv import load_dotenv
 
+from deal_room.generate_sample_pitch_deck import SAMPLE_DECK_PATH
 from deal_room.models import (
     FinancialAssessment,
     InvestmentMemo,
@@ -15,8 +20,18 @@ from deal_room.models import (
     RiskAssessment,
     TechnicalAssessment,
 )
+from deal_room.tools import PitchDeckReaderTool, WebSearchTool
 
 load_dotenv()
+
+# Project-local, persistent LanceDB path for the unified memory system
+# (Milestone 4, Part A). Explicit rather than CrewAI's global default data
+# dir so the memory store this project builds up is self-contained,
+# inspectable, and doesn't risk colliding with an embedding-dimension
+# mismatch from some unrelated app's data at the shared default path (see
+# README M4 section for why that matters: the default vector_dim assumes
+# OpenAI's 3072-dim embeddings, ours are ONNX MiniLM's 384-dim).
+_MEMORY_STORAGE_PATH = Path(__file__).resolve().parents[2] / ".crewai_memory"
 
 
 class SpecialistCallLog:
@@ -185,6 +200,57 @@ class DealRoomCrew:
         specialist_call_log.register_agent(agent_instance, self.run_id, role)
         return agent_instance
 
+    def _new_memory(self) -> Memory:
+        """Build a fresh unified `Memory` instance (short-term recall +
+        entity tracking) for this run, backed by fully local/free
+        components — no OpenAI dependency:
+
+        - `embedder={"provider": "onnx"}`: chromadb's built-in ONNX
+          all-MiniLM-L6-v2 model, downloaded once (~80MB) and cached
+          locally, run entirely on-device. CrewAI's actual default here
+          (passing no `embedder=` at all) is `OpenAIEmbeddingFunction` with
+          `text-embedding-3-small` — its own default-embedder docstring
+          claims ONNX MiniLM but the code builds OpenAI regardless — so
+          leaving this unset would have silently required OPENAI_API_KEY.
+        - `llm=self._new_llm()`: a dedicated fresh Cerebras instance for
+          Memory's own internal encode/recall analysis, instead of the
+          class default `llm="gpt-5.4-mini"` (also OpenAI-shaped). Kept
+          separate from any agent's own LLM instance — same reasoning as
+          `_new_llm()`'s own docstring: no shared instances, no
+          contamination.
+        - `storage=LanceDBStorage(path=_MEMORY_STORAGE_PATH)`: local,
+          file-based, no server or API key. Deliberately a fixed
+          project-local path (not per-instance/per-run) so that memories
+          saved in one kickoff persist and are recallable by a *different*
+          `DealRoomCrew()` instance in a later kickoff — this is what
+          Part A's two-call recall test depends on.
+
+        Verified directly (see README M4 section) that this configuration
+        remembers and recalls correctly with zero OpenAI calls involved.
+        """
+        self._memory_llm_instance = self._new_llm()
+        return Memory(
+            llm=self._memory_llm_instance,
+            embedder={"provider": "onnx"},
+            storage=LanceDBStorage(path=str(_MEMORY_STORAGE_PATH)),
+        )
+
+    def pop_memory_llm_usage(self):
+        """Return this run's Memory analysis LLM usage (prompt/completion/
+        total tokens, request count), or None if memory wasn't built yet.
+
+        Memory's own LLM calls (extracting entities/categories on
+        `remember()`, distilling sub-queries on `recall(depth="deep")`)
+        run on a dedicated instance never passed to `Crew.agents` or
+        `manager_agent` — so `Crew.calculate_usage_metrics()` /
+        `result.token_usage` never sees them. This is the only way to
+        observe that cost; report it alongside `result.token_usage`,
+        don't substitute one for the other.
+        """
+        if getattr(self, "_memory_llm_instance", None) is None:
+            return None
+        return self._memory_llm_instance.get_token_usage_summary()
+
     def pop_specialist_calls(self) -> list[str]:
         """Return (and clear) the list of specialist roles delegated to
         during this instance's run, one entry per completed delegation
@@ -209,6 +275,7 @@ class DealRoomCrew:
                 llm=self._new_llm(),
                 allow_delegation=False,
                 verbose=True,
+                tools=[PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH))],
             ),
             "Startup Financial Analyst",
         )
@@ -221,6 +288,10 @@ class DealRoomCrew:
                 llm=self._new_llm(),
                 allow_delegation=False,
                 verbose=True,
+                tools=[
+                    WebSearchTool(),
+                    PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH)),
+                ],
             ),
             "Market & Competitive Analyst",
         )
@@ -233,6 +304,7 @@ class DealRoomCrew:
                 llm=self._new_llm(),
                 allow_delegation=False,
                 verbose=True,
+                tools=[PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH))],
             ),
             "Technical Due Diligence Lead",
         )
@@ -245,6 +317,7 @@ class DealRoomCrew:
                 llm=self._new_llm(),
                 allow_delegation=False,
                 verbose=True,
+                tools=[PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH))],
             ),
             "Risk & Governance Assessor",
         )
@@ -298,5 +371,48 @@ class DealRoomCrew:
             tasks=self.tasks,
             process=Process.hierarchical,
             manager_agent=self.managing_partner(),
+            memory=self._new_memory(),
             verbose=True,
         )
+
+
+# Milestone 4: enabling memory adds its own LLM calls on top of the crew's
+# own delegation calls -- every agent step triggers a memory save-extraction
+# call, and every step's prompt-building triggers a memory recall call
+# (CrewAI's default recall depth is "deep", itself LLM-driven). Observed
+# directly: a single kickoff with memory enabled made 75 *separate*
+# memory-analysis LLM requests on top of the crew's own 22 -- enough load
+# against one shared Cerebras API key to exhaust its per-minute token quota
+# mid-run, including during CrewAI's own rate-limit-recovery path (which
+# itself makes an LLM call to summarize messages), with no further
+# fallback -- an unguarded kickoff() crashed outright on this exact path in
+# testing. RATE_LIMIT_COOLDOWN_SECONDS/kickoff_with_retry give callers a
+# cooldown and small retry budget instead of losing an entire run to a
+# transient quota exhaustion.
+RATE_LIMIT_COOLDOWN_SECONDS = 90
+MAX_KICKOFF_RETRIES = 2
+
+
+def kickoff_with_retry(crew: Crew, inputs: dict, max_retries: int = MAX_KICKOFF_RETRIES):
+    """Run crew.kickoff(), retrying with a cooldown pause on failure.
+
+    See the module-level comment above for why this exists: memory's own
+    LLM traffic can exhaust the shared Cerebras rate limit badly enough
+    that CrewAI's own internal recovery path fails too, with no fallback
+    left, propagating as an unhandled exception.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return crew.kickoff(inputs=inputs)
+        except Exception as e:  # noqa: BLE001 - any failure here should trigger backoff+retry
+            last_exc = e
+            if attempt < max_retries:
+                print(
+                    f"kickoff failed ({type(e).__name__}: {e}) -- "
+                    f"waiting {RATE_LIMIT_COOLDOWN_SECONDS}s and retrying "
+                    f"(attempt {attempt + 2}/{max_retries + 1})"
+                )
+                time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
+    assert last_exc is not None
+    raise last_exc

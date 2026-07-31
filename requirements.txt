@@ -2,3 +2,5 @@ crewai
 crewai-tools
 python-dotenv
 pydantic
+pymupdf
+ddgs

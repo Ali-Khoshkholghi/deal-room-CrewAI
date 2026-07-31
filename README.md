@@ -1,11 +1,14 @@
-# deal-room — Milestone 3
+# deal-room — Milestone 4
 
 A CrewAI pipeline that turns unstructured pitch text into a decision-ready
-investment memo. As of this milestone, there's no fixed pipeline order at
-all: a Managing Partner agent acts as the crew's **manager**, deciding at
-runtime which of its 4 specialists (financial, market, technical, risk) to
-consult, in what order, and whether to follow up — all running on Cerebras
-via LiteLLM.
+investment memo. Since Milestone 3, there's no fixed pipeline order at all:
+a Managing Partner agent acts as the crew's **manager**, deciding at runtime
+which of its 4 specialists (financial, market, technical, risk) to consult,
+in what order, and whether to follow up — all running on Cerebras via
+LiteLLM. Milestone 4 adds persistent memory (recall across separate
+`kickoff()` calls) and two custom tools (live web search, PDF pitch-deck
+reading) — see ["Milestone 4: memory and custom
+tools"](#milestone-4-memory-and-custom-tools) below.
 
 > **Correction:** An earlier version of this section claimed vague-financials
 > inputs cost more tokens than normal inputs (848K vs ~400K). This was measured
@@ -441,6 +444,212 @@ Per-run CSV (re-run): `/tmp/m3_batch_results.csv`. This overwrites the
 first attempt's CSV at the same path — see that section above for the
 first attempt's numbers if you need them.
 
+## Milestone 4: memory and custom tools
+
+Milestone 4 adds two things to the M3 hierarchical crew: CrewAI's unified
+`Memory` (recall across separate `kickoff()` calls, not just within one),
+and two custom `BaseTool` subclasses (`tools.py`) — live web search and PDF
+pitch-deck reading — attached to the specialists. Both are always on now;
+there's no separate "M4 mode."
+
+**Read this section's status up front**: Part B (tools) is fully verified
+with real, live evidence. Part A (memory) is verified as a mechanism in
+isolation, but the specific two-kickoff recall test never completed live —
+blocked by a real Cerebras API quota exhaustion, not a defect found in the
+design. Part C's dedicated verification script was written and its pieces
+smoke-tested, but wasn't run end-to-end for the same reason. Details below,
+reported honestly rather than assumed.
+
+### Part A: memory
+
+`crew.py`'s `_new_memory()` builds a `crewai.memory.unified_memory.Memory`
+instance with:
+
+- `embedder={"provider": "onnx"}` — chromadb's bundled `all-MiniLM-L6-v2`
+  ONNX model, downloaded once (~80MB, cached under `~/.cache/chroma/`) and
+  run entirely on-device. **This was a deliberate, necessary override, not
+  a default**: `Memory`'s own `_default_embedder()` builds an
+  `OpenAIEmbeddingFunction` (`text-embedding-3-small`) when `embedder` is
+  left unset, and separately, `ChromaDBConfig`'s default embedding function
+  docstring claims "using all-MiniLM-L6-v2 via ONNX" while the code right
+  below it actually builds `OpenAIEmbeddingFunction` regardless — a
+  docstring/code mismatch in CrewAI itself. Leaving `embedder` unset here
+  would have silently required `OPENAI_API_KEY`, exactly what this task
+  asked to avoid or flag.
+- `llm=` a dedicated, fresh Cerebras `LLM` instance (via `self._new_llm()`,
+  never shared with any agent) for Memory's own internal encode/recall
+  analysis — instead of the class default `llm="gpt-5.4-mini"`, also
+  OpenAI-shaped.
+- `storage=LanceDBStorage(path=<project-root>/.crewai_memory)` — a fixed,
+  project-local, file-based path (gitignored), so memories saved in one
+  `DealRoomCrew()` instance's kickoff are recallable by a *different*
+  instance's kickoff later, which is what the recall test below depends on.
+
+**Mechanism verified directly, in isolation** (cheap, no full crew run
+needed): constructing two separate `Memory()` Python objects pointed at the
+same storage path, calling `.remember()` on the first and `.recall()` on
+the second, correctly stored and retrieved a fact about "Brightledger" with
+LLM-inferred entities/categories/importance, using only Cerebras + the
+local ONNX embedder — zero OpenAI calls involved:
+
+```
+remembered record: id='345aa0c4-...' content='Brightledger is a B2B SaaS
+company with a risk profile of medium...' categories=['B2B', 'SaaS', 'Risk
+Profile', 'Regulatory Exposure'] metadata={'entities': ['Brightledger'], ...}
+recall results: [MemoryMatch(record=MemoryRecord(...same content...),
+score=0.71, match_reasons=['semantic', 'recency', 'importance'])]
+```
+
+CrewAI also turned out to auto-save and auto-recall without any explicit
+tool call needed: every agent's `execute_task()` — including specialists
+reached via ad-hoc delegation, not just crew-dispatched tasks — calls
+`_save_to_memory()` on finishing (extracts and remembers facts from its own
+answer) and `_retrieve_memory_context()` before answering (recalls
+relevant memories and injects them into its own prompt), as long as
+`agent.crew._memory` is set. No prompt changes were needed to make this
+happen; it's automatic, not tool-gated, in this CrewAI version.
+
+**The live, full end-to-end test (Part A's actual ask): not completed.**
+`main.py` runs kickoff #1 (Brightledger, full `company_info`) then kickoff
+#2 (a follow-up question naming Brightledger but not re-supplying any
+figures) in the same process, checking whether kickoff #2's own output
+reproduces kickoff #1's specific numbers. Kickoff #1 succeeded cleanly (see
+cost table below). Kickoff #2 failed twice, both times before producing a
+usable answer:
+
+1. First attempt: a Cerebras `429` ("Tokens per minute limit exceeded")
+   during CrewAI's own `recover_from_context_length` repair path — which
+   itself makes an LLM call to summarize messages — with no further
+   fallback, propagating as an unhandled exception.
+2. After adding retry-with-cooldown logic (`kickoff_with_retry()` /
+   `RATE_LIMIT_COOLDOWN_SECONDS` in `crew.py`) and re-running from a clean
+   memory store: a Cerebras `429` again, but this time "Tokens **per
+   day** limit exceeded" — a daily quota, not a transient per-minute one, so
+   no cooldown fixes it. Swapping in a second, different-looking
+   `CEREBRAS_API_KEY` and retrying immediately hit the *identical* error on
+   the very first LLM call of the run — strong evidence the daily quota is
+   shared at the Cerebras **account** level, not per-key, so the swap
+   didn't add fresh headroom.
+
+This is a real, external capacity constraint, not something the memory
+integration code is doing wrong — but it means the specific claim "kickoff
+#2 recalls kickoff #1's facts, verified end-to-end" **cannot be reported as
+confirmed**, only as architecturally sound and ready to verify once quota
+allows. `main.py` is left with the retry/cooldown logic and the full
+two-kickoff + recall-marker-check flow in place; re-running
+`PYTHONPATH=src python -m deal_room.main` once the account's daily quota
+resets will produce the actual recall verdict.
+
+One relevant data point from the run that did succeed: **memory adds
+substantial LLM load of its own.** Kickoff #1's crew made 22 requests
+(111,197 tokens); Memory's own dedicated analysis LLM — save-extraction
+and deep-recall query distillation, one call per agent step of either kind
+— made **75 separate requests (122,362 tokens)**, more request volume than
+the entire hierarchical crew's own work. That's very likely what pushed
+this run into the rate-limit contention described above; enabling memory
+roughly doubles total token spend and adds several times the request count
+of the underlying crew.
+
+### Part B: custom tools
+
+`tools.py` adds two `BaseTool` subclasses:
+
+- **`WebSearchTool`** (assigned to `market_analyst`): wraps crewai-tools'
+  `SerperDevTool` when `SERPER_API_KEY` is set, falling back automatically
+  to `ddgs` (a keyless DuckDuckGo wrapper) when Serper isn't usable.
+  Verified directly: the `SERPER_API_KEY` present in `.env` returns `403
+  Forbidden` — an unauthorized/placeholder value, consistent with this
+  README's earlier note that Serper "isn't used yet." A hand-rolled
+  `requests` + HTML-scrape fallback was tried first and rejected: DuckDuckGo's
+  plain HTML endpoint intermittently returned a bot-detection challenge
+  page instead of results, even moments after a successful call — too
+  unreliable for a tool whose invocation this milestone needs to actually
+  confirm. `ddgs` returned real results reliably in every test.
+- **`PitchDeckReaderTool`** (assigned to all 4 specialists): extracts text
+  from a PDF via PyMuPDF. `generate_sample_pitch_deck.py` programmatically
+  builds a fictional 5-page Brightledger deck
+  (`src/deal_room/sample_data/brightledger_pitch_deck.pdf`) with detail
+  `company_info` deliberately never mentions — named competitors (Tipalti,
+  Bill.com), the actual tech stack (AWS/Kubernetes/FastAPI/Postgres+Redis,
+  SOC 2 Type I in progress), and funding terms ($2.5M seed at a $12M
+  pre-money cap) — so a specialist has a genuine informational reason to
+  read it, not just a tool available to call for its own sake.
+
+**Live invocation confirmed, with real counts**, from the successful
+kickoff #1 run's verbose trace: `read_pitch_deck` was invoked **16
+times** and `web_search` **34 times** across the specialists. More
+tellingly, deck-only facts showed up verbatim in the *final* memo —
+`Tipalti`, `Bill.com`, `Kubernetes`, `FastAPI`, `SOC 2 Type I`, the "$2.5M
+seed at a $12M pre-money" figure, and "both co-founders are first-time
+founders" all appear in the market/technical/risk sections of the output —
+proof the tool's content was actually synthesized into the memo, not
+fetched and ignored. Neither tool needed the manager to be told a deck
+existed in the task input text; each tool's own `description` (shown to
+its agent regardless of what the manager asks) was enough for specialists
+to discover and use it autonomously.
+
+`verify_m4_integration.py` was written to confirm this same thing more
+rigorously — via CrewAI's `ToolUsageFinishedEvent` on the global event bus
+(the same "hooks, not log-scraping" principle as M3's Fix 3, rather than
+grepping the verbose trace by hand) — but wasn't run live itself; see
+"What blocked full verification" below. The manual log-count evidence
+above is real and from an actual live run, just gathered differently than
+that script does it.
+
+### Part C: integration test
+
+Kickoff #1 above **is**, in substance, a live Part C run: the full M3
+hierarchical crew, memory enabled, both tools attached, on the standard
+`company_info` pitch — it just came from `main.py`'s Part A run rather
+than `verify_m4_integration.py`'s dedicated script. Results:
+
+- **`output_pydantic` parsed correctly**: `recommendation: "needs more
+  diligence"`, `confidence: "medium"`, a complete `InvestmentMemo`.
+- **Both custom tools invoked multiple times** — see Part B above.
+- **Cost vs. M3 baseline** — see the table below.
+
+The dedicated `verify_m4_integration.py` script (event-bus-based tool
+tracking, explicit M3-baseline cost comparison) was written and its
+individual pieces smoke-tested, but was **not run end-to-end live**: the
+Cerebras account's daily quota was exhausted immediately after kickoff #1
+above, before this script got its turn. It's ready to run once quota
+resets: `PYTHONPATH=src python -m deal_room.verify_m4_integration`.
+
+### Cost comparison: M2 → M3 → M4
+
+| | **M2 — sequential** | **M3 — hierarchical** | **M4 — hierarchical + memory + tools** |
+|---|---|---|---|
+| Tokens (normal pitch) | 60,580 | 94,920 | 111,197 (crew) + 122,362 (memory analysis, separate) = **233,559 total** |
+| Requests | 25 | 15 | 22 (crew) + 75 (memory analysis) = **97 total** |
+| Wall-clock | 63.6s | 444.4s | 1,589.0s |
+| vs. M3 baseline | — | — | **+146% tokens, +547% requests, +258% wall-clock** |
+
+The M4 row is a single run, same caveat as everywhere else in this
+document: directional, not a statistically robust sample. But the
+direction is unambiguous and large — memory's own LLM traffic alone
+(122,362 tokens / 75 requests) exceeds the entire M3 crew's per-run cost
+from the row above it. Tool calls (50 total between both tools) add
+further LLM round-trips on top of that, though their individual token
+contribution wasn't isolated separately from the crew's own 111,197.
+
+### What blocked full verification, honestly
+
+In order: a full day of M3 batch-testing (documented above) followed by
+M4's memory-heavy runs pushed the shared Cerebras API key past its
+per-minute quota (causing the kickoff #2 crash described in Part A), and
+eventually past its **per-day** quota entirely — confirmed by a second,
+different-looking API key hitting the identical "tokens per day" error on
+its very first LLM call, meaning the daily cap is account-level, not
+per-key, so swapping keys didn't unblock anything. This is an external
+capacity constraint, not a bug surfaced in the memory/tools integration
+itself — every piece that *could* be verified cheaply and in isolation
+(the embedder, the analysis LLM, the storage persistence, both tools
+individually) was verified and works. What remains unverified live is
+specifically: kickoff #2's actual recall output, and
+`verify_m4_integration.py`'s own event-bus-based tool-tracking run. Both
+are ready to execute as soon as the account's daily quota resets — no
+code changes needed, just quota.
+
 ## Running it
 
 1. **Python version**: this project targets Python 3.11.
@@ -467,8 +676,16 @@ first attempt's numbers if you need them.
    ```
 
    Get a key from the [Cerebras Cloud dashboard](https://cloud.cerebras.ai/)
-   (free tier available). `SERPER_API_KEY` isn't used yet — it's a
-   placeholder for a later milestone that adds web-search tooling.
+   (free tier available). `SERPER_API_KEY` is optional — `WebSearchTool`
+   (Milestone 4) tries it first and falls back automatically to a keyless
+   `ddgs`-based search if it's absent, invalid, or unauthorized (see
+   Milestone 4's Part B above).
+
+   Milestone 4's ONNX embedder (used for memory) downloads a small
+   (~80MB) local model file on first use, cached under
+   `~/.cache/chroma/onnx_models/` — the first run that touches memory
+   will pause briefly for that download; every run after is instant and
+   fully offline.
 
 4. **Run the pipeline** (from the `deal_room/` directory):
 
@@ -476,16 +693,21 @@ first attempt's numbers if you need them.
    PYTHONPATH=src python -m deal_room.main
    ```
 
-   This kicks off the hierarchical crew against a hardcoded fictional
-   startup pitch. There's only one `Task` now, so `main.py` prints the
-   final `InvestmentMemo` plus execution stats (wall-clock time, token
-   usage) — to see *how* the Managing Partner got there (which
-   specialists it consulted, in what order, any re-queries), pipe stdout
-   to a log file, since the delegation calls only show up in the verbose
-   trace:
+   As of Milestone 4, this runs the hierarchical crew **twice** in the
+   same process: once against a hardcoded fictional startup pitch, then
+   again on a follow-up question about the same company that doesn't
+   re-supply its figures — checking whether CrewAI's memory recalls them
+   (see Milestone 4's Part A above for why that second call's result
+   isn't guaranteed and needs to be read from the actual output, not
+   assumed). Each `Task` still prints the final `InvestmentMemo` plus
+   execution stats (wall-clock time, token usage, and memory's own
+   separately-tracked LLM usage) — to see *how* the Managing Partner got
+   there (which specialists it consulted, in what order, any re-queries,
+   any tool calls), pipe stdout to a log file, since delegation and tool
+   calls only show up in the verbose trace:
 
    ```bash
-   PYTHONPATH=src python -m deal_room.main 2>&1 | tee /tmp/m3_run.log
+   PYTHONPATH=src python -m deal_room.main 2>&1 | tee /tmp/m4_run.log
    ```
 
    For the delegation-behavior verification (normal pitch vs. a
@@ -494,6 +716,22 @@ first attempt's numbers if you need them.
 
    ```bash
    PYTHONPATH=src python -m deal_room.test_hierarchical
+   ```
+
+   For the Milestone 4 integration test (memory + both tools together,
+   confirming tool invocation via CrewAI's event bus and reporting cost
+   vs. the M3 baseline — see Milestone 4's Part C above), run:
+
+   ```bash
+   PYTHONPATH=src python -m deal_room.verify_m4_integration
+   ```
+
+   To (re)generate the sample pitch deck PDF used by `PitchDeckReaderTool`
+   (already committed at `src/deal_room/sample_data/brightledger_pitch_deck.pdf`,
+   regenerating just overwrites it with the same fictional content):
+
+   ```bash
+   PYTHONPATH=src python -m deal_room.generate_sample_pitch_deck
    ```
 
 ## Troubleshooting
@@ -551,6 +789,37 @@ call, but if it happens repeatedly, check that agent `role:` strings in
 `agents.yaml` don't contain anything unusual (extra punctuation, etc.)
 beyond the normal YAML folding.
 
+**`LLMContextLengthExceededError` / `429 Tokens per minute limit exceeded`**
+
+A real Cerebras rate limit, not a code bug — CrewAI's error message is
+misleading (it's phrased as a context-length problem; the underlying cause
+is `429 too_many_tokens_error`). Enabling memory (Milestone 4) makes this
+much more likely: every agent step adds its own save/recall LLM call on
+top of the crew's own calls (see Milestone 4's Part A — 75 memory-related
+requests were observed in a single run, more than the crew's own 22).
+`crew.py`'s `kickoff_with_retry()` retries with a cooldown
+(`RATE_LIMIT_COOLDOWN_SECONDS`) for exactly this case.
+
+**`429 Tokens per day limit exceeded`**
+
+A different, harder failure than the per-minute one above — this is a
+daily quota, so retrying with a short cooldown won't help; the error
+recurs identically until the quota actually resets. Confirmed in testing
+that this quota is shared at the **Cerebras account level, not per API
+key** — swapping in a second key from the same account hit the identical
+error on the very first LLM call of the next run. If you hit this, either
+wait for the account's daily quota to reset, or use a key from a genuinely
+different account.
+
+**`Invalid type Memory for attribute 'crew_memory' value. Expected one of
+['bool', 'str', 'bytes', 'int', 'float']...`**
+
+A harmless warning seen in verbose output once Milestone 4's memory is
+enabled — some internal tracing/telemetry serialization step tries to log
+the crew's `memory` field and can't represent a `Memory` object as one of
+its primitive-typed fields. Cosmetic; doesn't affect memory's actual
+save/recall behavior.
+
 ## Milestone roadmap
 
 - **Milestone 1** ✅: single agent, single task, structured
@@ -560,12 +829,18 @@ beyond the normal YAML folding.
   combines their structured output into a single `InvestmentMemo` via
   `context` chaining — no re-reading of the raw pitch by the synthesis
   agent.
-- **Milestone 3** ✅ (this one): hierarchical crew (`Process.hierarchical`)
-  — the Managing Partner becomes the crew's `manager_agent` and dynamically
+- **Milestone 3** ✅: hierarchical crew (`Process.hierarchical`) — the
+  Managing Partner becomes the crew's `manager_agent` and dynamically
   delegates to the 4 specialists via a single open-ended task, rather than
   running a fixed final task over pre-computed outputs.
-- **Milestone 4**: add CrewAI memory (short-term/long-term) and custom
-  tools (e.g. web search, document retrieval over a real data room).
+- **Milestone 4** ✅ (this one, partially verified live — see its section
+  above): CrewAI unified memory (local ONNX embeddings + a dedicated
+  Cerebras analysis LLM, no OpenAI dependency) plus two custom tools
+  (`WebSearchTool`, `PitchDeckReaderTool`). Tools are fully verified live
+  with real invocation counts and evidence in the final output. Memory's
+  mechanism is verified in isolation; the full two-kickoff recall claim
+  and the dedicated integration script are written and ready but blocked
+  on a real Cerebras account-level daily quota exhaustion, not a defect.
 - **Milestone 5**: wrap the crew in a CrewAI `Flow` for more control over
   branching, state, and multi-step orchestration beyond a single
   `kickoff()` call.
