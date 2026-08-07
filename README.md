@@ -1705,6 +1705,91 @@ follow-up questions derived from the first pass's specific red flags) —
 unchanged by this session's testing, which deliberately avoided spending
 quota on the stub's payload.
 
+## Live-run investigation and fixes (2026-08-08)
+
+A live run against the flow-based entry point (`flow_main.py`, with a
+newer, shorter Brightledger `company_info` variant) surfaced two real
+problems, investigated first, fixed after confirming root cause.
+
+**Issue 1: "OpenAI API call failed" during a Cerebras-only run.**
+Investigated and resolved as a misleading-label artifact, not an actual
+OpenAI call — full root-cause trace, with the exact class-inheritance
+evidence, is now documented in
+["Troubleshooting"](#troubleshooting) under "`OpenAI API call failed:
+...` during a Cerebras-backed run". Short version: `OpenAICompatibleCompletion`
+(what Cerebras models actually resolve to) subclasses `OpenAICompletion`,
+inheriting its hardcoded `"OpenAI API call failed: {e}"` error string
+regardless of actual provider — confirmed via direct `type(llm)`/`.provider`/
+`.is_litellm` inspection of a live-built manager agent, not assumed. No
+code fix needed for this one; it's a documentation fix (the Troubleshooting
+entry) so the next person who hits it doesn't chase a nonexistent OpenAI
+dependency.
+
+**Issue 2: `market_analyst` drift ("freight audit" instead of invoice
+reconciliation), fixed.** The same live run showed `market_analyst`
+running 19+ web searches, many for "freight audit software" /
+"freight invoice automation" — despite Brightledger being B2B invoice
+*reconciliation* for mid-market finance teams, not freight auditing.
+Investigation found two contributing gaps, both real:
+
+1. **No domain grounding in the prompt chain.** `agents.yaml`'s
+   `market_analyst.goal` was fully generic ("Assess market size,
+   competitive landscape, and timing for a startup") with no instruction
+   to anchor search terms to the company's own stated domain — nothing
+   stopped the model from drifting to an adjacent-sounding category and
+   then searching repeatedly trying to confirm its own wrong guess.
+2. **No iteration cap tight enough to catch it.** `max_iter` was never
+   set anywhere in `crew.py`; CrewAI's own default
+   (`agents/agent_builder/base_agent.py`, `Agent.max_iter: int =
+   Field(default=25)`) is loose enough that 19+ searches never tripped
+   it.
+
+**Fixes applied:**
+
+- `agents.yaml`: `market_analyst.goal` now opens with "using the
+  company's own stated industry and product description as the primary
+  source of truth for search terms — do not substitute an adjacent or
+  assumed market category."
+- `tasks.yaml`'s `produce_investment_memo` description gained an explicit
+  anti-drift paragraph: base search queries on `company_info`'s exact
+  terminology, and if searches don't match the company's stated domain,
+  don't keep rephrasing toward a different category — note the mismatch
+  and proceed rather than search indefinitely.
+- `crew.py`'s `market_analyst()` now sets `max_iter=10` (CrewAI's default
+  is 25) — scoped to this one agent, not crew-wide. Reasoning: only
+  `market_analyst` has an external, open-ended tool (live web search)
+  that can compound a wrong assumption through repeated queries; the
+  other 3 specialists' only tool, `PitchDeckReaderTool`, reads one fixed
+  local file and has no comparable drift-and-search-again failure mode —
+  no evidence surfaced that they share this risk, so their `max_iter`
+  stays at CrewAI's default.
+
+**Verified:**
+
+- Construct-check: both YAML files parse correctly (`yaml.safe_load`);
+  building a fresh `DealRoomCrew().crew()` shows `market_analyst.max_iter
+  == 10` while the other 3 specialists remain at the default `25`.
+- Live check: one kickoff with the same invoice-reconciliation
+  `company_info` that drifted before. Every single search query stayed
+  anchored to the real domain — `"automated invoice reconciliation"
+  market size`, `"invoice reconciliation SaaS" market`, `"invoice
+  reconciliation" SaaS competitors`, `invoice reconciliation SaaS
+  platform`, and 12 more, all invoice-reconciliation/SaaS-terminology,
+  zero mentions of freight or logistics anywhere. **16 total `web_search`
+  calls** (down from 19+, captured via `ToolUsageFinishedEvent.tool_args`,
+  not log-scraping) across what the log shows was more than one
+  delegation to `market_analyst` — and the log confirms the new cap is
+  doing real work, not just sitting unused: `"Maximum iterations reached.
+  Requesting final answer."` fired at least once. The final memo's
+  `market_summary` correctly discusses the real market ("global
+  invoice-reconciliation platform market... $5.84bn by 2030, 13.9% CAGR")
+  and names real, relevant competitors (Tipalti, Airbase, SolveXia, Yooz,
+  BlackLine, Basware, Coupa) — all invoice/AP-automation players, not
+  freight/logistics ones. Cost: **26 requests, 95,638 tokens, 511.6s**
+  (this run also hit 14 transient rate-limit events, self-recovered,
+  consistent with genuine Cerebras-side load rather than anything related
+  to either fix).
+
 ## Running it
 
 1. **Python version**: this project targets Python 3.11.
@@ -1870,6 +1955,50 @@ key** — swapping in a second key from the same account hit the identical
 error on the very first LLM call of the next run. If you hit this, either
 wait for the account's daily quota to reset, or use a key from a genuinely
 different account.
+
+**`OpenAI API call failed: ...` during a Cerebras-backed run**
+
+Not an actual call to OpenAI — CrewAI's own labeling artifact, confirmed
+by inspecting the installed package's source directly (`crewai==1.15.9`),
+not assumed. This project's `LLM(model="cerebras/...")` resolves to
+`crewai.llms.providers.openai_compatible.completion.OpenAICompatibleCompletion`
+(confirmed empirically via `type(llm)`), which subclasses
+`crewai.llms.providers.openai.completion.OpenAICompletion` — Cerebras (and
+Deepseek, Ollama, OpenRouter) reuse CrewAI's native OpenAI provider class
+as their base, because their APIs are OpenAI-wire-protocol-compatible. The
+string `"OpenAI API call failed: {e}"` is hardcoded in that shared parent
+class and fires for **any** failure from a class in that family,
+regardless of which actual provider was being called — the same
+misleading-label pattern as the `LLMContextLengthExceededError` entry
+above, different symptom text. Verified directly: a live crew's
+`manager_agent.llm` shows `provider == "cerebras"`, `is_litellm == False`,
+and a correctly-populated Cerebras `api_key` — there is no OpenAI key
+anywhere in this project's `.env`, `.env.example`, or environment to even
+authenticate a real OpenAI call with.
+
+A `queue_exceeded` error specifically indicates **Cerebras' own inference
+request queue was overloaded** (their hardware serves inference through a
+request queue), not a quota or token-count issue — a different failure
+mode from the `too_many_tokens_error`/`token_quota_exceeded` types
+documented in the two entries above, but the same "OpenAI"-labeled
+wrapper text applies. If you want to fully confirm which provider's
+servers a specific failed request actually hit, check the request URL in
+the raw log (`api.cerebras.ai` vs `api.openai.com`) — the error label
+alone won't tell you.
+
+One related, currently-latent gap found during this investigation:
+`crewai.utilities.converter.py`'s `Converter.to_json()`/`ato_json()`
+unconditionally construct `InternalInstructor`, which for a
+`cerebras/...` model routes through the `instructor` package's
+`_build_cerebras()` — which requires the `cerebras.cloud.sdk` Python
+package. That package is not installed in this project (not in
+`requirements.txt`). Not currently reachable through this project's
+`output_pydantic=InvestmentMemo` usage (the native
+`OpenAICompatibleCompletion` class handles structured output directly via
+the OpenAI SDK's own mechanism, confirmed by the absence of any
+`instructor` import in that file) — but any future code path that calls
+`output_json` for a Cerebras-backed agent would hit a real
+`ConfigurationError`, not a silent OpenAI fallback.
 
 **`Invalid type Memory for attribute 'crew_memory' value. Expected one of
 ['bool', 'str', 'bytes', 'int', 'float']...`**

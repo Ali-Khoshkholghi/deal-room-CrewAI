@@ -21,13 +21,12 @@ load_dotenv()
 
 # Same test pitch as Milestones 1-4, for continuity.
 COMPANY_INFO = """
-Brightledger is a B2B SaaS platform that helps mid-market logistics
-companies automate freight invoice reconciliation. We launched 14 months
-ago and are now at $42,000 MRR, up from $9,000 MRR a year ago. Monthly
-logo churn is running around 4%. We have 11 people on the team (7
-engineering, 2 sales, 2 ops) and raised a $1.8M pre-seed round 18 months
-ago from two angel investors and a regional fund. We're now in early
-conversations for a seed round.
+Company: Brightledger
+B2B SaaS platform for automated invoice reconciliation, targeting mid-market 
+finance teams (50-500 employees). Seed stage, 14 months post-launch. 
+MRR $42,000 (up from $9,000 eight months ago). Churn 4% monthly. 
+Team of 6, founders previously at Stripe and Brex. Raised $2.5M at $12M 
+pre-money. 38 paying customers, average contract $1,100/mo.
 """
 
 

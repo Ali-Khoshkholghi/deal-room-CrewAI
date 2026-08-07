@@ -131,6 +131,14 @@ produce_investment_memo:
     have for detail beyond what's in the summary above, you don't need to
     fetch that detail yourself.
 
+    When researching market and competitors, base search queries on the
+    exact terminology used in company_info above — not an inferred or
+    adjacent category. If initial searches return results that don't
+    match the company's stated domain, do not keep rephrasing toward a
+    different category chasing a match; note the mismatch and proceed
+    with the information already available rather than searching
+    indefinitely.
+
     The `recommendation` field must be exactly one of these three strings,
     with spaces (not underscores) and no other punctuation or casing
     changes: 'pursue', 'pass', 'needs more diligence'. For example, write

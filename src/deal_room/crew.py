@@ -286,6 +286,20 @@ class DealRoomCrew:
                 verbose=True,
                 memory=False,
                 tools=[WebSearchTool(), *self._deck_tools()],
+                # Fix (2026-08-08): CrewAI's own default (Agent.max_iter,
+                # agents/agent_builder/base_agent.py) is 25, never
+                # overridden here before -- confirmed loose enough to let a
+                # live run through 19+ web_search calls chasing a
+                # self-generated wrong market category ("freight audit"
+                # instead of the company's actual "invoice reconciliation")
+                # without ever tripping it. Only market_analyst has an
+                # unbounded external tool that can compound a wrong
+                # assumption this way (repeated live search queries); the
+                # other 3 specialists' only tool, PitchDeckReaderTool, reads
+                # one fixed local file and has no comparable drift-and-
+                # search-again failure mode, so this cap is scoped to
+                # market_analyst specifically, not applied crew-wide.
+                max_iter=10,
             ),
             "Market & Competitive Analyst",
         )
