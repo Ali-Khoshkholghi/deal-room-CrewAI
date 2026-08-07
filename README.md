@@ -8,61 +8,58 @@ Cerebras via LiteLLM.
 
 ---
 
-## Milestone 5: CrewAI Flows
+## Milestone 2: Sequential Crew
 
-`flow.py`'s `DealRoomFlow` wraps the M3/M4 hierarchical crew in a CrewAI
-`Flow`, adding a conditional second pass above the crew itself.
+`Process.sequential` with four analyst tasks chained via CrewAI's `context=`
+mechanism. Each upstream `Task`'s `TaskOutput` is serialized into the
+downstream task's prompt.
 
-**Topology:**
+**Key gotcha:** an *unset* `context` in `Process.sequential` is not "no
+context" — it's "auto-aggregate every prior task's output so far." The four
+analyst tasks needed `context=[]` explicitly to run independently; without it,
+`analyze_market` silently inherited `analyze_financials`'s findings.
 
-```
-run_initial_analysis (@start)
-        |
-        v
-decide_deep_dive (@router — reads state.initial_memo)
-        |
-   +----+----+
-   |         |
-"deep_dive"  "skip_deep_dive"
-   |         |
-   v         v
-run_deep_dive   finalize_without_deep_dive
-```
+---
 
-Router condition: `memo.confidence == "low" or memo.recommendation == "needs
-more diligence"`. A failed parse (`initial_memo is None`) routes to
-`skip_deep_dive` rather than crashing.
+## Milestone 3: Hierarchical Crew
 
-**State schema** (`DealRoomFlowState`): `company_info`, `pitch_deck_path`,
-`initial_memo`, `deep_dive_triggered`, `final_memo`, `pass_count`,
-`needs_human_review`. Subclasses `FlowState` — a plain `BaseModel` fails with
-a real `ValidationError` on construction because `Flow` requires an `id` field.
+`Process.hierarchical` — the Managing Partner is passed as `manager_agent=`,
+not in `agents`. There is exactly one `Task` (`produce_investment_memo`) with
+**no `agent` set**, which is what grants the manager the delegation tool pair
+scoped to all crew members. Sequencing of specialist calls is an LLM decision
+made fresh on every `kickoff()`.
 
-**Live test results (2026-08-07):** Router mechanics confirmed correct — reads
-the real memo and applies its condition. The `skip_deep_dive` path is
-structurally verified but not exercised by a real memo (both test pitches came
-back `"needs more diligence"/"medium"`). The deep-dive pass is a deliberate
-stub.
+A structural constraint: the manager cannot also be a regular crew member
+(`ValidationError: manager_agent_in_agents`). CrewAI's `@agent` decorator
+auto-registers every decorated method into `self.agents`, so `managing_partner()`
+in `crew.py` is a plain, undecorated method.
 
-**Real gotcha — Flow subclassing:** `Flow`'s method discovery iterates only
-`flow_class.__dict__`, not the MRO. Subclassing `DealRoomFlow` to override one
-method silently drops the other three from the flow definition, and `kickoff()`
-executes nothing. Fix: monkey-patch directly on the parent class instead of
-subclassing.
+### M2 vs M3
 
-**Fixes (2026-08-08):**
+| | M2 — sequential | M3 — hierarchical |
+|---|---|---|
+| Process | `Process.sequential` | `Process.hierarchical` |
+| Who calls each specialist | Fixed order | Manager decides at runtime |
+| Specialist coverage | Guaranteed — all 4 always execute | Not guaranteed; 1 of 4 single runs consulted only 2 |
+| `output_pydantic` reliability | 100% | ~50% — two distinct failure modes (nested dict in str field; exact Literal value mismatch) |
+| Cost (normal pitch) | 60,580 tokens / 25 req / 63.6s | 94,920 tokens / 15 req / 444.4s |
+| When to choose | Predictable cost/latency, fixed checklist | Steps vary by input; flexibility worth the reliability cost |
 
-- **`PitchDeckReaderTool` is now conditional.** Previously always attached to
-  every specialist with a hardcoded default path — invoked reflexively even
-  when no deck was referenced. `DealRoomCrew` now takes an explicit `deck_path:
-  str | None = None`; specialists only get the tool when it's set. `flow.py`'s
-  `pitch_deck_path` state field now flows through to `DealRoomCrew(deck_path=...)`.
+### Re-query behavior: negative result
 
-- **Hard cap on escalation.** `DealRoomFlowState` tracks `pass_count` and
-  `needs_human_review`. `MAX_PASSES = 2` is enforced inside `decide_deep_dive`
-  — defensive but explicit. If the deep-dive result is still uncertain,
-  `needs_human_review` is set to `True` and the memo is returned flagged, not
-  silently presented as resolved.
+Across every cleanly-logged run, **the manager never re-queried a specialist
+for a thin or hedged answer**, despite the task description explicitly
+instructing it to. This was tested deliberately: one pitch stripped financials
+to produce a thin answer; the manager accepted it without follow-up every time.
+Stated as a finding about this version of CrewAI's hierarchical process, not a
+bug to fix.
+
+### `Literal` constraints
+
+`confidence`, `moat_credibility`, `overall_risk_level`, and `recommendation`
+are typed as `Literal[...]` in `models.py` — turns silent semantic drift into a
+loud validation failure. A `field_validator` normalizes common mismatches
+(underscores vs spaces, case) before rejecting genuine garbage.
 
 ---
 
@@ -118,58 +115,61 @@ M4's memory line item is now zero — no LLM calls, no tokens, no quota consumed
 
 ---
 
-## Milestone 3: Hierarchical Crew
+## Milestone 5: CrewAI Flows
 
-`Process.hierarchical` — the Managing Partner is passed as `manager_agent=`,
-not in `agents`. There is exactly one `Task` (`produce_investment_memo`) with
-**no `agent` set**, which is what grants the manager the delegation tool pair
-scoped to all crew members. Sequencing of specialist calls is an LLM decision
-made fresh on every `kickoff()`.
+`flow.py`'s `DealRoomFlow` wraps the M3/M4 hierarchical crew in a CrewAI
+`Flow`, adding a conditional second pass above the crew itself.
 
-A structural constraint: the manager cannot also be a regular crew member
-(`ValidationError: manager_agent_in_agents`). CrewAI's `@agent` decorator
-auto-registers every decorated method into `self.agents`, so `managing_partner()`
-in `crew.py` is a plain, undecorated method.
+**Topology:**
 
-### M2 vs M3
+```
+run_initial_analysis (@start)
+        |
+        v
+decide_deep_dive (@router — reads state.initial_memo)
+        |
+   +----+----+
+   |         |
+"deep_dive"  "skip_deep_dive"
+   |         |
+   v         v
+run_deep_dive   finalize_without_deep_dive
+```
 
-| | M2 — sequential | M3 — hierarchical |
-|---|---|---|
-| Process | `Process.sequential` | `Process.hierarchical` |
-| Who calls each specialist | Fixed order | Manager decides at runtime |
-| Specialist coverage | Guaranteed — all 4 always execute | Not guaranteed; 1 of 4 single runs consulted only 2 |
-| `output_pydantic` reliability | 100% | ~50% — two distinct failure modes (nested dict in str field; exact Literal value mismatch) |
-| Cost (normal pitch) | 60,580 tokens / 25 req / 63.6s | 94,920 tokens / 15 req / 444.4s |
-| When to choose | Predictable cost/latency, fixed checklist | Steps vary by input; flexibility worth the reliability cost |
+Router condition: `memo.confidence == "low" or memo.recommendation == "needs
+more diligence"`. A failed parse (`initial_memo is None`) routes to
+`skip_deep_dive` rather than crashing.
 
-### Re-query behavior: negative result
+**State schema** (`DealRoomFlowState`): `company_info`, `pitch_deck_path`,
+`initial_memo`, `deep_dive_triggered`, `final_memo`, `pass_count`,
+`needs_human_review`. Subclasses `FlowState` — a plain `BaseModel` fails with
+a real `ValidationError` on construction because `Flow` requires an `id` field.
 
-Across every cleanly-logged run, **the manager never re-queried a specialist
-for a thin or hedged answer**, despite the task description explicitly
-instructing it to. This was tested deliberately: one pitch stripped financials
-to produce a thin answer; the manager accepted it without follow-up every time.
-Stated as a finding about this version of CrewAI's hierarchical process, not a
-bug to fix.
+**Live test results (2026-08-07):** Router mechanics confirmed correct — reads
+the real memo and applies its condition. The `skip_deep_dive` path is
+structurally verified but not exercised by a real memo (both test pitches came
+back `"needs more diligence"/"medium"`). The deep-dive pass is a deliberate
+stub.
 
-### `Literal` constraints
+**Real gotcha — Flow subclassing:** `Flow`'s method discovery iterates only
+`flow_class.__dict__`, not the MRO. Subclassing `DealRoomFlow` to override one
+method silently drops the other three from the flow definition, and `kickoff()`
+executes nothing. Fix: monkey-patch directly on the parent class instead of
+subclassing.
 
-`confidence`, `moat_credibility`, `overall_risk_level`, and `recommendation`
-are typed as `Literal[...]` in `models.py` — turns silent semantic drift into a
-loud validation failure. A `field_validator` normalizes common mismatches
-(underscores vs spaces, case) before rejecting genuine garbage.
+**Fixes (2026-08-08):**
 
----
+- **`PitchDeckReaderTool` is now conditional.** Previously always attached to
+  every specialist with a hardcoded default path — invoked reflexively even
+  when no deck was referenced. `DealRoomCrew` now takes an explicit `deck_path:
+  str | None = None`; specialists only get the tool when it's set. `flow.py`'s
+  `pitch_deck_path` state field now flows through to `DealRoomCrew(deck_path=...)`.
 
-## Milestone 2: Sequential Crew
-
-`Process.sequential` with four analyst tasks chained via CrewAI's `context=`
-mechanism. Each upstream `Task`'s `TaskOutput` is serialized into the
-downstream task's prompt.
-
-**Key gotcha:** an *unset* `context` in `Process.sequential` is not "no
-context" — it's "auto-aggregate every prior task's output so far." The four
-analyst tasks needed `context=[]` explicitly to run independently; without it,
-`analyze_market` silently inherited `analyze_financials`'s findings.
+- **Hard cap on escalation.** `DealRoomFlowState` tracks `pass_count` and
+  `needs_human_review`. `MAX_PASSES = 2` is enforced inside `decide_deep_dive`
+  — defensive but explicit. If the deep-dive result is still uncertain,
+  `needs_human_review` is set to `True` and the memo is returned flagged, not
+  silently presented as resolved.
 
 ---
 
