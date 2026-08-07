@@ -9,7 +9,6 @@ from crewai.events.types.agent_events import AgentExecutionCompletedEvent
 from crewai.project import CrewBase, agent, crew, output_pydantic, task
 from dotenv import load_dotenv
 
-from deal_room.generate_sample_pitch_deck import SAMPLE_DECK_PATH
 from deal_room.models import (
     FinancialAssessment,
     InvestmentMemo,
@@ -131,6 +130,35 @@ class DealRoomCrew:
     RiskAssessment = output_pydantic(RiskAssessment)
     InvestmentMemo = output_pydantic(InvestmentMemo)
 
+    def __init__(self, deck_path: str | None = None) -> None:
+        # Fix (2026-08-08): PitchDeckReaderTool used to be attached to every
+        # specialist unconditionally, with a hardcoded default_file_path --
+        # meaning it was always available and, empirically, always used
+        # (specialists invoked it reflexively regardless of whether the
+        # input already looked complete; confirmed directly in the
+        # 2026-08-07 skip-branch Flow test, where read_pitch_deck fired 12
+        # times against an input that never mentioned a deck at all, and
+        # the deck's fixed content pushed even a deliberately strong
+        # synthetic pitch toward "needs more diligence"). Choice-based
+        # avoidance ("the tool is there, just don't use it if irrelevant")
+        # isn't reliable, per that evidence -- so the fix is at the
+        # attachment layer, not the prompt layer: no `deck_path` here means
+        # no specialist gets the tool at all for this run (see the
+        # `financial_analyst()` etc. builders below), not a tool they have
+        # and choose not to call. `DealRoomCrew()` still defaults to no
+        # deck -- callers opt in explicitly (see `flow.py`'s
+        # `state.pitch_deck_path`, now actually wired through, for the
+        # motivating case).
+        #
+        # Safe to add a custom `__init__` here despite `@CrewBase`: its
+        # metaclass (`CrewBaseMeta.__call__`, crewai/project/crew_base.py)
+        # calls `super().__call__(*args, **kwargs)` -- ordinary Python
+        # instantiation, which runs this `__init__` -- and only *after*
+        # that runs `_initialize_crew_instance()` to wire up configs/agents.
+        # Confirmed directly: `self.deck_path` is set and available by the
+        # time `self.agents` is first accessed inside `crew()` below.
+        self.deck_path = deck_path
+
     def _new_llm(self) -> LLM:
         """Build a brand-new Cerebras LLM client — called once per agent,
         never cached or shared between agents or across DealRoomCrew
@@ -226,6 +254,14 @@ class DealRoomCrew:
     # `Crew(...)`, so `crew._memory` stays `None` and that fallback
     # resolves to nothing anywhere in the crew.
 
+    def _deck_tools(self) -> list[PitchDeckReaderTool]:
+        """`[PitchDeckReaderTool(...)]` if this run has a deck_path, else
+        `[]` -- the tool is absent from the agent entirely when there's no
+        deck, not present-but-unused. See `__init__`'s comment for why."""
+        if not self.deck_path:
+            return []
+        return [PitchDeckReaderTool(default_file_path=self.deck_path)]
+
     @agent
     def financial_analyst(self) -> Agent:
         return self._register_specialist(
@@ -235,7 +271,7 @@ class DealRoomCrew:
                 allow_delegation=False,
                 verbose=True,
                 memory=False,
-                tools=[PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH))],
+                tools=self._deck_tools(),
             ),
             "Startup Financial Analyst",
         )
@@ -249,10 +285,7 @@ class DealRoomCrew:
                 allow_delegation=False,
                 verbose=True,
                 memory=False,
-                tools=[
-                    WebSearchTool(),
-                    PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH)),
-                ],
+                tools=[WebSearchTool(), *self._deck_tools()],
             ),
             "Market & Competitive Analyst",
         )
@@ -266,7 +299,7 @@ class DealRoomCrew:
                 allow_delegation=False,
                 verbose=True,
                 memory=False,
-                tools=[PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH))],
+                tools=self._deck_tools(),
             ),
             "Technical Due Diligence Lead",
         )
@@ -280,7 +313,7 @@ class DealRoomCrew:
                 allow_delegation=False,
                 verbose=True,
                 memory=False,
-                tools=[PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH))],
+                tools=self._deck_tools(),
             ),
             "Risk & Governance Assessor",
         )

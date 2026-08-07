@@ -2,16 +2,15 @@
 same test pitch, but drives `DealRoomFlow` instead of `DealRoomCrew`
 directly.
 
-NOT RUN as of 2026-08-06 — Cerebras quota was exhausted (see README's
-Milestone 4 "Memory cost fix" section) when this was written. Live
-verification (does the router actually trigger the deep dive on a real
-low-confidence memo, does `state.final_memo` end up correctly populated
-either way) is deferred to the same quota-reset re-run as Milestone 4's
-memory-cost levers — see README's "Milestone 5: CrewAI Flows (scaffolded,
-untested)" section. `deal_room.flow`'s own module docstring and
-`DealRoomFlow`'s class docstring have been construct-checked (the Flow
-instantiates, its state schema validates, its topology renders via
-`build_flow_structure()`/`plot()`) but never kicked off live.
+Live-tested 2026-08-07 (router mechanism confirmed correct on two real
+crew passes; see README's Milestone 5 section for the full writeup,
+including why the "skip the deep dive" branch remains unconfirmed against
+a real non-triggering memo). Updated 2026-08-08 for two fixes: `deck_path`
+is now threaded through as an optional argument to `run()` (previously
+`DealRoomFlowState.pitch_deck_path` was accepted but unused), and the
+result printout below now surfaces `pass_count` and `needs_human_review`
+so the escalation-cap fix (`flow.py`'s `MAX_PASSES`) is visible to a
+caller, not just present in state.
 """
 
 from dotenv import load_dotenv
@@ -49,14 +48,25 @@ def _print_memo(label: str, memo) -> None:
     print(f"Confidence        : {memo.confidence}")
 
 
-def run():
+def run(deck_path: str | None = None):
     flow = DealRoomFlow()
-    flow.kickoff(inputs={"company_info": COMPANY_INFO})
+    flow.kickoff(inputs={"company_info": COMPANY_INFO, "pitch_deck_path": deck_path})
 
     print("\n" + "=" * 70)
     print("MILESTONE 5 FLOW RESULT")
     print("=" * 70)
-    print(f"Deep dive triggered: {flow.state.deep_dive_triggered}")
+    print(f"Pass count          : {flow.state.pass_count}")
+    print(f"Deep dive triggered : {flow.state.deep_dive_triggered}")
+    print(f"Needs human review  : {flow.state.needs_human_review}")
+    if flow.state.needs_human_review:
+        print(
+            "\n*** STILL UNCERTAIN AFTER ESCALATION *** -- the deep dive "
+            "ran (the one extra pass MAX_PASSES allows) and its own result "
+            "was still confidence='low' or recommendation='needs more "
+            "diligence'. This flow does not auto-escalate further; treat "
+            "final_memo below as provisional, pending human review, not a "
+            "resolved recommendation."
+        )
 
     _print_memo("Initial memo (first pass)", flow.state.initial_memo)
     if flow.state.deep_dive_triggered:

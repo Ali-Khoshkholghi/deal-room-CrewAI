@@ -122,10 +122,14 @@ produce_investment_memo:
     Cover financial health, market position, technical credibility, and
     risk profile. Delegate to your specialist analysts as needed, and if
     any specialist's initial answer is too thin or vague, re-query them
-    for more detail before finalizing. Each specialist has their own tools
-    available (a pitch deck reader, and for the market analyst, live web
-    search) — let them decide when to use those for detail beyond what's
-    in the summary above; you don't need to fetch that detail yourself.
+    for more detail before finalizing. The market analyst has a live web
+    search tool available for real, current competitor/market data. A
+    pitch deck reader tool is available to specialists only when a deck
+    was actually provided for this run — do not assume one exists or
+    instruct a specialist to check for one if the summary above doesn't
+    reference a deck; let specialists use whichever tools they actually
+    have for detail beyond what's in the summary above, you don't need to
+    fetch that detail yourself.
 
     The `recommendation` field must be exactly one of these three strings,
     with spaces (not underscores) and no other punctuation or casing

@@ -17,6 +17,7 @@ from crewai.events.event_bus import crewai_event_bus
 from crewai.events.types.tool_usage_events import ToolUsageFinishedEvent
 
 from deal_room.crew import DealRoomCrew, kickoff_with_retry
+from deal_room.generate_sample_pitch_deck import SAMPLE_DECK_PATH
 
 load_dotenv()
 
@@ -52,7 +53,12 @@ def _on_tool_usage_finished(source, event: ToolUsageFinishedEvent) -> None:
 
 
 def run():
-    deal_room_crew = DealRoomCrew()
+    # As of 2026-08-08, PitchDeckReaderTool is only attached to specialists
+    # when a deck_path is actually provided (see crew.py's __init__ /
+    # _deck_tools()) -- this script's whole point is confirming the deck
+    # tool gets invoked, so it opts in explicitly here rather than relying
+    # on the old always-attached default.
+    deal_room_crew = DealRoomCrew(deck_path=str(SAMPLE_DECK_PATH))
     crew = deal_room_crew.crew()
 
     start = time.monotonic()

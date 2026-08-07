@@ -1220,15 +1220,22 @@ Cerebras or anyone else.
   page instead of results, even moments after a successful call — too
   unreliable for a tool whose invocation this milestone needs to actually
   confirm. `ddgs` returned real results reliably in every test.
-- **`PitchDeckReaderTool`** (assigned to all 4 specialists): extracts text
-  from a PDF via PyMuPDF. `generate_sample_pitch_deck.py` programmatically
-  builds a fictional 5-page Brightledger deck
+- **`PitchDeckReaderTool`**: extracts text from a PDF via PyMuPDF.
+  `generate_sample_pitch_deck.py` programmatically builds a fictional
+  5-page Brightledger deck
   (`src/deal_room/sample_data/brightledger_pitch_deck.pdf`) with detail
   `company_info` deliberately never mentions — named competitors (Tipalti,
   Bill.com), the actual tech stack (AWS/Kubernetes/FastAPI/Postgres+Redis,
   SOC 2 Type I in progress), and funding terms ($2.5M seed at a $12M
   pre-money cap) — so a specialist has a genuine informational reason to
-  read it, not just a tool available to call for its own sake.
+  read it, not just a tool available to call for its own sake. **Update
+  (2026-08-08): no longer assigned to all 4 specialists unconditionally.**
+  Originally always attached with a hardcoded default deck path — since
+  found (Milestone 5's skip-branch test, 2026-08-07) to be invoked
+  reflexively regardless of whether the input referenced a deck at all.
+  Now conditional on an explicit `deck_path` at `DealRoomCrew`
+  construction — see "Fixes (2026-08-08)" under Milestone 5 below for the
+  full design and verification.
 
 **Live invocation confirmed, with real counts**, from the successful
 kickoff #1 run's verbose trace: `read_pitch_deck` was invoked **16
@@ -1377,8 +1384,11 @@ separate uncertainty judgment. A memo that failed to parse at all
 crashing the flow: there's nothing to re-diligence against.
 
 **State schema** (`DealRoomFlowState`, in `flow.py`): `company_info`,
-`pitch_deck_path` (accepted but not yet wired to anything — see below),
-`initial_memo`, `deep_dive_triggered`, `final_memo`. `final_memo` is set to
+`pitch_deck_path` (as of 2026-08-08, actually wired through to
+`DealRoomCrew(deck_path=...)` — see "Fixes (2026-08-08)" below; originally
+accepted but unused), `initial_memo`, `deep_dive_triggered`, `final_memo`,
+and (also added 2026-08-08) `pass_count` and `needs_human_review` for the
+deep-dive escalation cap. `final_memo` is set to
 `initial_memo` by default at the end of the first pass and only
 overwritten if the deep-dive branch actually runs, so a caller reading
 `state.final_memo` after `kickoff()` always gets a real memo regardless of
@@ -1401,13 +1411,15 @@ the branching logic and state schema real and testable now — the
 mechanism CrewAI provides for this to work at all was the point of this
 scaffolding pass, not the deep-dive prompt's content.
 
-**`pitch_deck_path` is accepted in the state schema but not wired to
-anything real yet.** The underlying M3/M4 crew's `PitchDeckReaderTool` is
-constructed with a hardcoded `default_file_path=str(SAMPLE_DECK_PATH)` per
-specialist agent in `crew.py`, not a path threaded through `Task` inputs
-the way `company_info` is. Making this field actually override which deck
-gets read is a real change to `crew.py`'s tool construction, out of scope
-for this scaffolding pass — flagged here rather than silently ignored.
+**`pitch_deck_path` was accepted in the state schema but not wired to
+anything real as of this scaffolding pass (2026-08-06).** The underlying
+M3/M4 crew's `PitchDeckReaderTool` was constructed with a hardcoded
+`default_file_path=str(SAMPLE_DECK_PATH)` per specialist agent in
+`crew.py`, not a path threaded through `Task` inputs the way
+`company_info` is — flagged here rather than silently ignored, and fixed
+2026-08-08 (see "Fixes (2026-08-08)" below): `crew.py` now takes an
+explicit `deck_path` constructor argument, `PitchDeckReaderTool` is only
+attached when one is set, and this field now actually flows through.
 
 **Construct-checks performed, no live API calls**:
 - `DealRoomFlow()` instantiates without error; `flow.state` is a valid
@@ -1516,11 +1528,101 @@ passes. The `skip_deep_dive` code path itself is a trivial two-line
 (instantiation, state validation, `build_flow_structure()`/`plot()`
 visualization) — but it has not been exercised by a real memo in a live
 run, because neither test input actually produced one. Re-engineering a
-pitch (or decoupling the deck from `company_info`, itself now a good
-argument for finally wiring up `pitch_deck_path` — still not done, see
-above) to reliably produce a "pass"/high-confidence memo is out of scope
-for this verification-only session; this is reported as an honest gap,
-not papered over as "tested."
+pitch to reliably produce a "pass"/high-confidence memo was out of scope
+for that verification-only session; reported as an honest gap, not
+papered over as "tested." One contributing cause — the deck's fixed
+content fighting a synthetic strong pitch — is now partially addressed;
+see the next section.
+
+### Fixes (2026-08-08)
+
+Two issues identified in the 2026-08-07 testing above, fixed the next day.
+
+**Fix 1: `PitchDeckReaderTool` attachment is now conditional, not
+reflexive.** The root cause of the skip-branch test's false-positive
+trigger wasn't really "the deck contradicts a synthetic strong pitch" —
+it was that the tool was *always* attached to every specialist, with a
+hardcoded default deck path, regardless of whether `company_info`
+referenced a deck at all. Specialists invoked it reflexively (confirmed
+directly: 12 `read_pitch_deck` calls against an input that never
+mentioned a deck), so choice-based avoidance ("the tool's there, just
+don't use it if it's not relevant") never worked — the fix had to be at
+the attachment layer, not the prompt layer.
+
+`crew.py`'s `DealRoomCrew` now takes an explicit `deck_path: str | None =
+None` constructor argument (safe to add despite `@CrewBase` — confirmed
+directly against `crewai/project/crew_base.py`'s `CrewBaseMeta.__call__`,
+which runs ordinary `__init__` before its own config/agent wiring, not
+instead of it). A new `_deck_tools()` helper returns
+`[PitchDeckReaderTool(...)]` when `deck_path` is set, `[]` otherwise, and
+all 4 specialist builders use it — so with no `deck_path`, a specialist
+doesn't *have* `read_pitch_deck` at all, not have it and decline to call
+it. `flow.py`'s `pitch_deck_path` state field — accepted since Milestone
+5's original scaffolding but never wired to anything — now actually
+flows through: `run_initial_analysis` and `run_deep_dive` both build
+`DealRoomCrew(deck_path=self.state.pitch_deck_path)`. `tasks.yaml`'s
+manager task description no longer assumes a deck reader is always
+available.
+
+Verified in two passes:
+
+- **Construct-check** (no API calls): with no `deck_path`, all 4
+  specialists' `.tools` lists correctly exclude `read_pitch_deck`
+  (`market_analyst` correctly keeps `web_search`); with `deck_path=str(SAMPLE_DECK_PATH)`,
+  all 4 correctly include it.
+- **Live check**: one short kickoff, no `deck_path`, default (disabled)
+  memory. First attempt hit this session's own self-imposed 10-minute
+  timeout — not a bug: the log showed normal progress (5 agents started,
+  heavy `web_search` activity, zero errors or retries) just running
+  longer than prior short-input runs, plausibly natural variance in how
+  much market research the specialist chose to do. Retried with a 15-minute
+  cap and completed cleanly: **20 requests, 112,135 tokens, 404.5s**.
+  `read_pitch_deck_calls: 0`, confirmed via CrewAI's own
+  `ToolUsageFinishedEvent` (not log-scraping) — the tool never fired.
+  `verify_m4_integration.py`, whose entire purpose is confirming the deck
+  tool *does* fire, now explicitly opts in with
+  `DealRoomCrew(deck_path=str(SAMPLE_DECK_PATH))` rather than relying on
+  the old always-on default.
+
+**Fix 2: a hard cap on Flow deep-dive escalation.** The prior topology
+had no path from `run_deep_dive` back to `decide_deep_dive` — so
+"infinite escalation" was never actually possible — but there was also no
+explicit handling for a deep dive whose own result was *still* uncertain:
+it would just become `final_memo`, indistinguishable from a normal,
+resolved result.
+
+`DealRoomFlowState` gained two fields: `pass_count: int = 0` (1 after the
+initial pass, 2 after a deep dive) and `needs_human_review: bool = False`.
+A module-level `MAX_PASSES = 2` constant is enforced *inside*
+`decide_deep_dive` itself (`if self.state.pass_count >= MAX_PASSES: return
+"skip_deep_dive"`) — defensive rather than load-bearing under the current
+topology, but it makes "at most one deep dive" an explicit, enforced
+property of the state machine rather than an accident of the graph shape;
+if a future change ever wired a loop back to this router, this is what
+would actually stop it. `run_deep_dive` now checks its own result against
+the same uncertainty criteria that triggered it in the first place
+(`confidence == "low"` or `recommendation == "needs more diligence"`); if
+still true, it sets `needs_human_review = True` and returns the deep-dive
+memo as `final_memo` anyway — explicitly flagged, not silently presented
+as resolved. `flow_main.py`'s printout now surfaces `pass_count` and
+`needs_human_review`, with a visible banner when the flag is set.
+
+Verified in two zero-cost passes (no live kickoff — the deep-dive crew is
+still a stub, so a real weak-then-weak sequence isn't needed to validate
+this structural logic):
+
+- **Construct-check**: `DealRoomFlowState()` defaults `pass_count=0`,
+  `needs_human_review=False`; `DealRoomFlow.flow_definition()` still finds
+  all 4 methods; `build_flow_structure()` still reports 4 nodes;
+  `flow.plot()` still renders — the topology is unchanged by this fix, as
+  expected (state-schema and single-router-guard changes only).
+- **Logic unit test**: called `decide_deep_dive()` directly (no
+  `kickoff()`) against 4 scenarios — fresh pass + weak memo → `"deep_dive"`;
+  fresh pass + strong memo → `"skip_deep_dive"`; **`pass_count` already at
+  `MAX_PASSES` + weak memo → `"skip_deep_dive"` regardless of confidence
+  (the hard cap firing, the case that matters)**; no memo → `"skip_deep_dive"`.
+  All 4 passed. The `still_uncertain` predicate `run_deep_dive` uses was
+  independently re-verified against both a weak and strong fake memo.
 
 ## Final production-readiness verdict (2026-08-07)
 
@@ -1838,4 +1940,12 @@ save/recall behavior.
   real CrewAI `Flow` subclassing gotcha was discovered and documented
   along the way: `Flow` method discovery only scans a class's own
   `__dict__`, not inherited members, so naively subclassing to override
-  one step silently drops the others from the flow definition.
+  one step silently drops the others from the flow definition. **Two
+  fixes landed 2026-08-08** (see "Fixes (2026-08-08)" above):
+  `PitchDeckReaderTool` is now attached to specialists only when a
+  `deck_path` is actually provided (construct- and live-verified: 0
+  invocations with none given), and the Flow now enforces a hard 2-pass
+  cap on deep-dive escalation with an explicit `needs_human_review` flag
+  when even the deep dive comes back uncertain (construct- and
+  logic-verified, no live kickoff needed since the deep-dive crew is
+  still a stub).
