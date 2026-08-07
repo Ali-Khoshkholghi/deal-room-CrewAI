@@ -4,3 +4,5 @@ python-dotenv
 pydantic
 pymupdf
 ddgs
+lancedb
+chromadb

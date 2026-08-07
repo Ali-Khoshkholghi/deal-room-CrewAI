@@ -2,13 +2,10 @@ import os
 import threading
 import time
 import uuid
-from pathlib import Path
 
 from crewai import LLM, Agent, Crew, Process, Task
 from crewai.events.event_bus import crewai_event_bus
 from crewai.events.types.agent_events import AgentExecutionCompletedEvent
-from crewai.memory.storage.lancedb_storage import LanceDBStorage
-from crewai.memory.unified_memory import Memory
 from crewai.project import CrewBase, agent, crew, output_pydantic, task
 from dotenv import load_dotenv
 
@@ -23,15 +20,6 @@ from deal_room.models import (
 from deal_room.tools import PitchDeckReaderTool, WebSearchTool
 
 load_dotenv()
-
-# Project-local, persistent LanceDB path for the unified memory system
-# (Milestone 4, Part A). Explicit rather than CrewAI's global default data
-# dir so the memory store this project builds up is self-contained,
-# inspectable, and doesn't risk colliding with an embedding-dimension
-# mismatch from some unrelated app's data at the shared default path (see
-# README M4 section for why that matters: the default vector_dim assumes
-# OpenAI's 3072-dim embeddings, ours are ONNX MiniLM's 384-dim).
-_MEMORY_STORAGE_PATH = Path(__file__).resolve().parents[2] / ".crewai_memory"
 
 
 class SpecialistCallLog:
@@ -200,57 +188,6 @@ class DealRoomCrew:
         specialist_call_log.register_agent(agent_instance, self.run_id, role)
         return agent_instance
 
-    def _new_memory(self) -> Memory:
-        """Build a fresh unified `Memory` instance (short-term recall +
-        entity tracking) for this run, backed by fully local/free
-        components — no OpenAI dependency:
-
-        - `embedder={"provider": "onnx"}`: chromadb's built-in ONNX
-          all-MiniLM-L6-v2 model, downloaded once (~80MB) and cached
-          locally, run entirely on-device. CrewAI's actual default here
-          (passing no `embedder=` at all) is `OpenAIEmbeddingFunction` with
-          `text-embedding-3-small` — its own default-embedder docstring
-          claims ONNX MiniLM but the code builds OpenAI regardless — so
-          leaving this unset would have silently required OPENAI_API_KEY.
-        - `llm=self._new_llm()`: a dedicated fresh Cerebras instance for
-          Memory's own internal encode/recall analysis, instead of the
-          class default `llm="gpt-5.4-mini"` (also OpenAI-shaped). Kept
-          separate from any agent's own LLM instance — same reasoning as
-          `_new_llm()`'s own docstring: no shared instances, no
-          contamination.
-        - `storage=LanceDBStorage(path=_MEMORY_STORAGE_PATH)`: local,
-          file-based, no server or API key. Deliberately a fixed
-          project-local path (not per-instance/per-run) so that memories
-          saved in one kickoff persist and are recallable by a *different*
-          `DealRoomCrew()` instance in a later kickoff — this is what
-          Part A's two-call recall test depends on.
-
-        Verified directly (see README M4 section) that this configuration
-        remembers and recalls correctly with zero OpenAI calls involved.
-        """
-        self._memory_llm_instance = self._new_llm()
-        return Memory(
-            llm=self._memory_llm_instance,
-            embedder={"provider": "onnx"},
-            storage=LanceDBStorage(path=str(_MEMORY_STORAGE_PATH)),
-        )
-
-    def pop_memory_llm_usage(self):
-        """Return this run's Memory analysis LLM usage (prompt/completion/
-        total tokens, request count), or None if memory wasn't built yet.
-
-        Memory's own LLM calls (extracting entities/categories on
-        `remember()`, distilling sub-queries on `recall(depth="deep")`)
-        run on a dedicated instance never passed to `Crew.agents` or
-        `manager_agent` — so `Crew.calculate_usage_metrics()` /
-        `result.token_usage` never sees them. This is the only way to
-        observe that cost; report it alongside `result.token_usage`,
-        don't substitute one for the other.
-        """
-        if getattr(self, "_memory_llm_instance", None) is None:
-            return None
-        return self._memory_llm_instance.get_token_usage_summary()
-
     def pop_specialist_calls(self) -> list[str]:
         """Return (and clear) the list of specialist roles delegated to
         during this instance's run, one entry per completed delegation
@@ -267,6 +204,28 @@ class DealRoomCrew:
         crewai_event_bus.flush()
         return specialist_call_log.end_run(self.run_id)
 
+    # CrewAI's automatic per-agent-step `Memory` (Milestone 4's levers
+    # #1/#3) is retired project-wide as of 2026-08-07: construct- and
+    # live-tested to cost hundreds of LLM requests per kickoff for
+    # bookkeeping alone (245 requests / 440K tokens in the worst measured
+    # case), and to still lose facts (churn figures, specialist-tool-
+    # derived detail) under its leanest tested configuration. Replaced by
+    # `custom_memory.py`'s `save_memo()`/`recall_memo()` — called once per
+    # `kickoff()` by the caller (see `main.py`), zero LLM calls in either
+    # function, not once per internal agent step. See README's "Custom
+    # memory layer" section for the full history and the numbers that
+    # motivated the switch.
+    #
+    # `memory=False` below is explicit documentation of intent, not what
+    # actually keeps these agents memory-free — `BaseAgent.resolve_memory()`
+    # normalizes both `False` and unset to `None`, so the two are literally
+    # indistinguishable after construction; every call site then falls back
+    # to `crew._memory` via `getattr(agent, "memory", None) or
+    # self._memory`. What actually keeps specialists (and now the manager
+    # too) memory-free is `crew()` below never passing `memory=` to
+    # `Crew(...)`, so `crew._memory` stays `None` and that fallback
+    # resolves to nothing anywhere in the crew.
+
     @agent
     def financial_analyst(self) -> Agent:
         return self._register_specialist(
@@ -275,6 +234,7 @@ class DealRoomCrew:
                 llm=self._new_llm(),
                 allow_delegation=False,
                 verbose=True,
+                memory=False,
                 tools=[PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH))],
             ),
             "Startup Financial Analyst",
@@ -288,6 +248,7 @@ class DealRoomCrew:
                 llm=self._new_llm(),
                 allow_delegation=False,
                 verbose=True,
+                memory=False,
                 tools=[
                     WebSearchTool(),
                     PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH)),
@@ -304,6 +265,7 @@ class DealRoomCrew:
                 llm=self._new_llm(),
                 allow_delegation=False,
                 verbose=True,
+                memory=False,
                 tools=[PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH))],
             ),
             "Technical Due Diligence Lead",
@@ -317,6 +279,7 @@ class DealRoomCrew:
                 llm=self._new_llm(),
                 allow_delegation=False,
                 verbose=True,
+                memory=False,
                 tools=[PitchDeckReaderTool(default_file_path=str(SAMPLE_DECK_PATH))],
             ),
             "Risk & Governance Assessor",
@@ -334,6 +297,21 @@ class DealRoomCrew:
     # "worker node" — any node can conditionally route to any other, so
     # there's no separate object needing its own instantiation path.
     def managing_partner(self) -> Agent:
+        # Historical note: Milestone 4 gave the manager its own dedicated
+        # `Memory` instance here (lever #3, "manager-only scoping"),
+        # decoupled from the specialists' memory-free agents above. Tested
+        # live 2026-08-07: it worked, in that memory-request volume dropped
+        # sharply and the core MRR-recall claim still held verbatim across
+        # a kickoff boundary — but churn recall regressed to an outright
+        # false denial, and all specialist-tool-derived facts stopped
+        # surviving between kickoffs, since only the manager (who never
+        # calls the deck/search tools itself) retained any memory at all.
+        # As of 2026-08-07 CrewAI's automatic memory is retired entirely —
+        # no `memory=` here means `resolve_memory()` normalizes to `None`,
+        # same mechanism as the specialists above. Cross-kickoff recall is
+        # now `custom_memory.py`'s job, driven explicitly by the caller
+        # (see `main.py`), not automatic per-agent-step hooks. See
+        # README's "Custom memory layer" section for the full history.
         return Agent(
             config=self.agents_config["managing_partner"],
             llm=self._new_llm(),
@@ -366,12 +344,18 @@ class DealRoomCrew:
 
     @crew
     def crew(self) -> Crew:
+        # No `memory=` here — deliberately. `Crew.memory` defaults to
+        # `False`, so `create_crew_memory()` (a `@model_validator` that
+        # runs automatically on construction) sets `crew._memory = None`.
+        # Combined with no agent (including the manager, as of 2026-08-07)
+        # being passed a `Memory` instance of its own, this crew now runs
+        # with CrewAI's automatic memory fully off — see the comment above
+        # `financial_analyst()` and `custom_memory.py` for what replaced it.
         return Crew(
             agents=self.agents,
             tasks=self.tasks,
             process=Process.hierarchical,
             manager_agent=self.managing_partner(),
-            memory=self._new_memory(),
             verbose=True,
         )
 

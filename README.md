@@ -453,12 +453,54 @@ pitch-deck reading — attached to the specialists. Both are always on now;
 there's no separate "M4 mode."
 
 **Read this section's status up front**: Part B (tools) is fully verified
-with real, live evidence. Part A (memory) is verified as a mechanism in
-isolation, but the specific two-kickoff recall test never completed live —
-blocked by a real Cerebras API quota exhaustion, not a defect found in the
-design. Part C's dedicated verification script was written and its pieces
-smoke-tested, but wasn't run end-to-end for the same reason. Details below,
-reported honestly rather than assumed.
+with real, live evidence. Part A (memory)'s two-kickoff recall test **has
+now completed live** (re-run after the Cerebras daily quota reset) —
+kickoff #2 reproduced kickoff #1's exact MRR figures without being re-told
+them, real evidence of recall, not an assumption. See "The live, full
+end-to-end test" below for verbatim proof. Part C's dedicated verification
+script (`verify_m4_integration.py`) still hasn't been run end-to-end — the
+two-kickoff scenario in `main.py` was used instead and covers the same
+ground (memory + both tools + cost comparison) — but nothing further blocks
+running that script too. A follow-up investigation into *why* memory adds
+so much LLM traffic (a separate open question from whether it works) is
+also now answered — see "Why memory costs so much, and a leaner option"
+below. **Update (2026-08-06): a follow-up fix-and-verify pass found the
+system, as measured, is not production-viable** — see "Memory cost fix:
+what was tried, and what's still open" below. Three things were
+implemented and construct-checked but not yet live-tested at that point:
+the recall config fix, a decoupled model for memory's own LLM (lever #1),
+and memory scoped to the manager agent only (lever #3).
+
+**Update (2026-08-07): levers #1 and #3 are now live-tested, combined,
+against a fresh quota reset.** See "Combined lever re-run (2026-08-07):
+live results" below for the full writeup. Short version: memory-request
+volume dropped sharply (245→12 requests for a comparable first pass) and
+the core MRR-recall claim still holds verbatim under manager-only memory
+scoping — but a new, real regression showed up (churn recall now fails
+outright, where before it was merely incomplete), and the "cheaper" number
+can't be cleanly attributed to the levers alone because the test
+deliberately also used a shorter `company_info` to conserve quota. Net
+verdict is still **not production-viable as measured**, now for sharper,
+narrower reasons than before — see that section for the actual numbers
+and the honest caveats. Milestone 5's `Flow` wrapper was also live-tested
+the same day — see "Milestone 5: CrewAI Flows (live-tested)" below,
+including a real CrewAI `Flow` subclassing gotcha discovered along the
+way.
+
+**Update (2026-08-07, later the same day): CrewAI's automatic memory is
+retired.** The combined-lever verdict above was the trigger — see "Custom
+memory layer (replacing CrewAI automatic memory)" below for the full
+design and verification. Short version: `crew.py` no longer builds a
+CrewAI `Memory` instance anywhere (crew-wide, per-specialist, or for the
+manager); a small hand-rolled `custom_memory.py` (LanceDB + local ONNX
+embeddings, the same infrastructure, driven directly) replaces it —
+`save_memo()`/`recall_memo()`, called once per `kickoff()` by the caller,
+zero LLM calls in either function. Verified via a zero-cost unit test
+(hand-built memo, exact round-trip) and one live kickoff (real memo,
+save→recall without a second kickoff, exact field match, memory added
+**zero** extra requests/tokens to the run). This supersedes Part A's
+"not production-viable" verdict for memory specifically — it isn't a
+fix to CrewAI's `Memory`, it's a replacement for it.
 
 ### Part A: memory
 
@@ -509,13 +551,115 @@ relevant memories and injects them into its own prompt), as long as
 `agent.crew._memory` is set. No prompt changes were needed to make this
 happen; it's automatic, not tool-gated, in this CrewAI version.
 
-**The live, full end-to-end test (Part A's actual ask): not completed.**
+**The live, full end-to-end test (Part A's actual ask): completed.** An
+earlier attempt (documented in the original version of this section, kept
+below for the historical record) hit a Cerebras **daily** quota exhaustion
+before kickoff #2 could run. After confirming via a minimal direct API ping
+that the daily quota had reset, `main.py` was re-run end-to-end:
+`PYTHONPATH=src python -m deal_room.main`, full log at `/tmp/m4_run_1786001117.log`.
+
+Kickoff #1 (Brightledger, full `company_info`) completed cleanly. Kickoff
+#2 (the follow-up query below, naming Brightledger but re-supplying none of
+its figures) also completed, and its output is the actual evidence:
+
+```
+Following up on Brightledger, the company we discussed earlier -- do not
+ask for its founding details, funding amount, team size, or MRR again,
+you already have those from before. Just answer: given what you already
+know about Brightledger, is the risk profile still "medium", or has
+anything changed? Also state what you recall about its MRR and monthly
+churn figures from before, if anything.
+```
+
+Kickoff #2's `InvestmentMemo.financial_summary` (verbatim from the run):
+
+> "Brightledger's monthly recurring revenue (MRR) increased from **$9,000**
+> to **$42,000**, indicating strong top‑line growth. However, more than 50%
+> of this MRR is concentrated in fewer than five accounts, exposing
+> significant revenue concentration risk. The company also exhibits high
+> churn, though no specific churn rate has been disclosed..."
+
+Kickoff #2's `InvestmentMemo.risk_summary` (verbatim — this is the direct
+answer to the query's actual question, "is the risk profile still medium,
+or has anything changed?"):
+
+> "Previously rated as medium risk, the risk profile has shifted to high
+> due to concentrated revenue, high customer churn, and an overall high
+> risk rating noted in prior assessments."
+
+Both `$9,000` and `$42,000` — the exact MRR figures from kickoff #1's
+`company_info` — appear verbatim in kickoff #2's own output, despite never
+appearing anywhere in kickoff #2's input (the follow-up query explicitly
+withholds them, "do not ask for ... MRR again"). The script's automated
+marker check confirms this mechanically, not just by eyeballing the memo:
+
+```
+Kickoff #1 figures found verbatim in kickoff #2's own output
+(never re-supplied in kickoff #2's input): ['42,000', '9,000']
+Hedging/no-information phrases found in kickoff #2's output: none
+RESULT: kickoff #2 reproduced specific figures from kickoff #1 without
+being re-told them -- real evidence of recall, not an assumption.
+```
+
+**This is a positive, verified result for Part A's actual ask.** Recall
+worked, on the specific thing this milestone set out to test, with the
+LLM's own output as proof rather than an assumption about the mechanism.
+
+Two honest caveats, so this isn't overstated:
+
+1. **Recall was real but incomplete.** Of the six figures the test script
+   checks for (`42,000`, `9,000`, `4%`, `1.8M`, `11 people`, `pre-seed`),
+   only the two MRR numbers came back verbatim. The monthly churn figure
+   (4%, present in kickoff #1's `company_info`) was recalled *qualitatively*
+   — kickoff #2 correctly says churn is "high" — but not *quantitatively*:
+   it explicitly states "no specific churn rate has been disclosed," which
+   is wrong; the 4% figure was disclosed, in kickoff #1. Team size, funding
+   amount, and the "pre-seed" round terminology don't appear anywhere in
+   kickoff #2's memo at all — though that may partly be an artifact of
+   `InvestmentMemo`'s schema (no field is shaped to hold "team size" or
+   "funding round type"), not necessarily a recall failure, since there's
+   nowhere in the output those facts would naturally land even if recalled.
+2. **The company description drifted.** Kickoff #2's `company_summary`
+   describes Brightledger as a "cloud‑based ledger platform that enables
+   businesses to automate accounting workflows through a rule‑engine
+   library" — notably different framing from kickoff #1's "B2B SaaS
+   platform that helps mid-market logistics companies automate freight
+   invoice reconciliation." The core financial facts and the risk
+   assessment came through accurately; the qualitative company description
+   did not survive the recall→re-synthesis round-trip with full fidelity.
+
+Net: recall is demonstrably working, verified with the model's own output
+as evidence — but "recall" here means "some facts came back accurately,
+others didn't," not perfect fidelity. Report it as a real, positive,
+partial result, not an all-or-nothing pass.
+
+**Memory's LLM load, measured on this run** (see "Why memory costs so much,
+and a leaner option" below for the mechanism): kickoff #1's crew made 52
+requests (227,166 tokens); memory's own dedicated analysis LLM made **245
+separate requests (440,579 tokens)** — nearly 5x the crew's own request
+count. Kickoff #2 made 17 crew requests (61,055 tokens) against 39 memory
+requests (74,019 tokens). This is a substantially larger sample than the
+75-request figure from the run measured before quota exhaustion (see below)
+— consistent with memory cost scaling with how many agent
+steps/delegations a run takes, not a fixed per-kickoff overhead: this
+run's manager delegated 36 times across both kickoffs (vs. ~5 in earlier
+clean M3/M4 single runs), plausibly itself inflated by degraded/retried
+specialist answers under the heavy rate-limit contention this run hit
+(1,276 total `429`s across both kickoffs — a mix of per-minute, per-hour,
+and, unlike the earlier blocked attempt, **zero** per-day hits, confirming
+the daily quota reset held for the whole run). No `kickoff_with_retry`
+cooldown was ever triggered — every individual failure recovered via
+CrewAI/memory's own per-call fallback (defaults on analysis failure)
+without the whole `kickoff()` ever crashing.
+
+<details>
+<summary>Original (superseded) account of the blocked attempt, kept for the record</summary>
+
 `main.py` runs kickoff #1 (Brightledger, full `company_info`) then kickoff
 #2 (a follow-up question naming Brightledger but not re-supplying any
 figures) in the same process, checking whether kickoff #2's own output
-reproduces kickoff #1's specific numbers. Kickoff #1 succeeded cleanly (see
-cost table below). Kickoff #2 failed twice, both times before producing a
-usable answer:
+reproduces kickoff #1's specific numbers. Kickoff #1 succeeded cleanly.
+Kickoff #2 failed twice, both times before producing a usable answer:
 
 1. First attempt: a Cerebras `429` ("Tokens per minute limit exceeded")
    during CrewAI's own `recover_from_context_length` repair path — which
@@ -531,24 +675,535 @@ usable answer:
    shared at the Cerebras **account** level, not per-key, so the swap
    didn't add fresh headroom.
 
-This is a real, external capacity constraint, not something the memory
-integration code is doing wrong — but it means the specific claim "kickoff
-#2 recalls kickoff #1's facts, verified end-to-end" **cannot be reported as
-confirmed**, only as architecturally sound and ready to verify once quota
-allows. `main.py` is left with the retry/cooldown logic and the full
-two-kickoff + recall-marker-check flow in place; re-running
-`PYTHONPATH=src python -m deal_room.main` once the account's daily quota
-resets will produce the actual recall verdict.
+One relevant data point from the run that did succeed before this block:
+Kickoff #1's crew made 22 requests (111,197 tokens); Memory's own dedicated
+analysis LLM made **75 separate requests (122,362 tokens)**, more request
+volume than the entire hierarchical crew's own work.
 
-One relevant data point from the run that did succeed: **memory adds
-substantial LLM load of its own.** Kickoff #1's crew made 22 requests
-(111,197 tokens); Memory's own dedicated analysis LLM — save-extraction
-and deep-recall query distillation, one call per agent step of either kind
-— made **75 separate requests (122,362 tokens)**, more request volume than
-the entire hierarchical crew's own work. That's very likely what pushed
-this run into the rate-limit contention described above; enabling memory
-roughly doubles total token spend and adds several times the request count
-of the underlying crew.
+</details>
+
+### Why memory costs so much, and a leaner option
+
+The 75-request (then 245-request, on the larger re-run above) figure
+prompted a follow-up question: is that inherent to what memory needs to do
+here, or is this project's config running more memory machinery than the
+recall test actually needs? Answered by reading the installed CrewAI
+package's own source (`crewai==1.15.9`, `.venv/lib/python3.11/site-packages/crewai/`),
+not assumed from older CrewAI docs.
+
+**First finding: the mental model of "`memory=True` enables short-term +
+long-term + entity + contextual memory" doesn't apply to this version.**
+That four-type architecture is gone. `find .venv/.../crewai -iname
+"*short_term*" -o -iname "*long_term*" -o -iname "*entity_memory*" -o
+-iname "*contextual*"` returns nothing — those classes don't exist in the
+installed package at all. `crew.py`'s `memory` field
+(`crewai/crew.py:249`) is typed `Memory | MemoryScope | MemorySlice`
+(discriminated by `memory_kind`), and `self.memory = self._new_memory()`
+passes one concrete `Memory` instance
+(`crewai.memory.unified_memory.Memory`) — CrewAI replaced the old
+multi-system architecture with a single unified memory class. There is
+exactly **one memory type active** in this crew, not a subset of four; the
+question "can we enable only entity memory and skip the rest" doesn't have
+an answer in this API, because there's nothing to select between anymore.
+
+**Second finding: yes, it makes its own LLM calls — traced to two specific
+call sites, both automatic and both uncapped in the worst case, not tool-gated.**
+
+1. **Recall, once per agent step** (`agent/core.py:_retrieve_memory_context`,
+   called before every specialist's and every manager turn's task prompt is
+   built): `memory.recall(task.description, limit=5)` — `depth` defaults to
+   `"deep"`, which runs `RecallFlow`:
+   - `analyze_query_step`: **1 LLM call** (`analyze_query`, distills the
+     query into sub-queries/scopes) — skipped only if the query is under
+     `query_analysis_threshold` (default 200) characters. Task descriptions
+     in this crew are long paragraphs, so this call fires on essentially
+     every recall.
+   - `decide_depth` router: if confidence comes back below
+     `confidence_threshold_low` (default 0.5) — likely early on, when the
+     memory store is sparse — and `exploration_budget` (default **1**) is
+     still available, it routes to `recursive_exploration`: **1 additional
+     LLM call per candidate scope that returned results**, not capped at
+     one call total. This is the single biggest uncapped multiplier in the
+     whole pipeline, and it's *worse* the emptier the store is — exactly
+     the situation early in a run, when there's the least value in
+     "exploring deeper."
+2. **Save, once per agent step** (`base_agent_executor.py:_save_to_memory`,
+   called after every completed agent step that wasn't a raw "delegate to
+   coworker" action): `memory.extract_memories(raw)` is **1 synchronous LLM
+   call** that turns the task+result text into N discrete memory
+   statements, then `memory.remember_many(extracted)` hands those to
+   `EncodingFlow.parallel_analyze`, which fires **1 LLM call per extracted
+   memory** with no similar existing record (`analyze_for_save`), or **2
+   concurrent calls per extracted memory** if a similar record is found
+   above `consolidation_threshold` (default 0.85) — one to resolve fields,
+   one to decide keep/update/delete (`analyze_for_consolidation`). If one
+   task result gets split into 3-5 discrete memories (typical for a
+   paragraph-length specialist answer), that's 3-10 LLM calls from a single
+   `_save_to_memory()` call.
+
+**Confirmed: embeddings are not the source.** `batch_embed` in
+`EncodingFlow` and the query-embedding step in `RecallFlow` both call the
+configured `embedder` (`onnx` here — chromadb's local MiniLM, no network
+call, no LLM), never the LLM. Every one of the 75/245 extra requests
+observed in testing is one of the two LLM call sites above, not embedding
+traffic — confirming what the crew.py docstring already suspected.
+
+**Third finding: the volume is real overhead, but not fully inherent to
+what Part A's recall test needs — two defaults inflate it without adding
+value for this use case:**
+
+- `exploration_budget=0` (default 1) fully disables
+  `recursive_exploration`. It fires *because* confidence is low, which is
+  most likely early in a run when the store is sparse — precisely when
+  "explore deeper" has the least to find. Turning it off doesn't weaken the
+  eventual recall in any way this milestone tested for (`recall()` still
+  returns whatever the plain vector search found); it just removes an
+  uncapped retry-for-more-context step this crew's task never asked for.
+- `query_analysis_threshold` set well above this crew's typical task
+  description length (`100_000`) makes `analyze_query_step` skip its LLM
+  call on virtually every recall here, falling back to embedding the raw
+  query directly. The query being distilled is always just
+  `task.description` — a fixed, already-well-formed string, not a messy
+  user query that benefits from LLM rephrasing — so the distillation step
+  buys little in this specific setup.
+
+**Both are now implemented** (`crew.py`'s `_new_memory()`), not just
+proposed:
+
+```python
+Memory(
+    llm=self._new_memory_llm(),
+    embedder={"provider": "onnx"},
+    storage=LanceDBStorage(path=str(_MEMORY_STORAGE_PATH)),
+    exploration_budget=0,
+    query_analysis_threshold=100_000,
+)
+```
+
+This isn't "entity-only memory" — that toggle doesn't exist in this
+version's API, per the first finding above. It's the closest real lever
+this single unified `Memory` class actually exposes: it keeps the
+save/extract/recall mechanism that Part A's cross-kickoff recall depends
+on fully intact, while removing the two call sites that fire regardless of
+whether this crew's specific recall need (a fixed, well-formed query,
+against a memory store that's often near-empty early in a run) benefits
+from them.
+
+**Status: structurally confirmed, not yet empirically validated end-to-end**
+(as of 2026-08-06). Constructing a `Memory` with these two fields set and
+inspecting them back off the instance confirms they're applied correctly.
+A live re-run attempt (see "Memory cost fix: what was tried, and what's
+still open" below) also confirmed **0 query-analysis calls fired at all**
+before it crashed on an unrelated quota issue — consistent with the code
+path being skipped by construction, not just luck. But no full kickoff has
+completed under this config yet, so there are no fresh before/after
+token/request numbers to report — only the mechanism-level guarantee from
+reading the source directly.
+
+**Known limitation of this fix, established before it was ever tested:**
+`exploration_budget` and `query_analysis_threshold` only affect the
+*recall* side of memory's calls (item 2 in "Second finding" above). Log
+evidence from the 245-request run breaks its failures down as **181
+save-side failures** (`analyze_for_save`, via `extract_memories()` →
+`remember_many()`'s per-extracted-memory fan-out) vs. **0 recall-side
+failures** (`analyze_query`) — meaning the save side is the dominant cost
+driver, by roughly 9-to-1, and this config change doesn't touch it at all.
+This was known from the source and the log evidence *before* the
+verification re-run was attempted — the fix was applied anyway because
+it's real and correct as far as it goes, not because it was expected to
+solve the problem alone.
+
+### Memory cost fix: what was tried, and what's still open
+
+Prompted by the 75→245-request variance above looking too large and too
+unpredictable for a production workflow. Four steps, done in order:
+
+**1. Apply the leaner recall config** — done, described above.
+
+**2. Find out *why* the 75-request and 245-request runs differed by 3x**,
+so the fix could be judged against the real driver instead of assumed to
+address it. Evidence used: failure-log signatures from the 245-request
+run's log (`/tmp/m4_run_1786001117.log`), broken down per kickoff:
+
+| | Kickoff #1 (245 mem. req.) | Kickoff #2 (39 mem. req.) |
+|---|---|---|
+| `delegate`/`ask_question` calls | 18 | 18 |
+| Final Answers (≈ agent steps) | 22 | 8 |
+| "Memory save analysis failed" | 181 | 68 |
+| "Consolidation analysis failed" | 21 | 10 |
+| "Query analysis failed" | 0 | 6 |
+
+Three hypotheses, tested against this evidence:
+
+- **Confidence-driven recall exploration**: not supported. Recall-side
+  failures (`Query analysis failed`) are 0 and 6 — a small fraction of the
+  202 and 78 total save+consolidation failures in the same two kickoffs.
+  Whatever `recursive_exploration` contributed, it wasn't the dominant
+  term.
+- **Growing memory store** (more existing records to reconcile against as
+  the store accumulates): real, but secondary. `.crewai_memory` had
+  accumulated **454 records** by the time the 245-request kickoff #1 ran
+  (residue from every prior verification test this milestone, never
+  cleared). Consolidation's share of save-side failures did rise slightly
+  from kickoff #1 to kickoff #2 (21/202 ≈ 10.4% → 10/78 ≈ 12.8%), consistent
+  with *some* store-growth effect. But per-step memory cost *dropped* from
+  kickoff #1 to kickoff #2 (245 reqs / 22 steps ≈ 11.1/step, vs. 39 reqs /
+  8 steps ≈ 4.9/step) despite the store being strictly larger going into
+  kickoff #2 — the opposite of what a dominant store-growth effect would
+  predict.
+- **Step count / work-per-step, not memory-specific at all**: best
+  supported. Kickoff #1's 245-request run delegated 18 times; a clean
+  single M3/M4 run typically delegates ~5 times. Memory's own calls scale
+  directly with agent-step count (one recall + one save-side fan-out per
+  step, mechanically) — more delegation, itself plausibly a symptom of the
+  same rate-limit contention degrading specialist answers and prompting
+  manager re-queries (see "What blocked full verification" above),
+  produces proportionally more memory calls without memory's own logic
+  changing at all.
+
+**3. Re-run the two-kickoff test under the new config: attempted, did not
+complete.** `.crewai_memory` was reset to fresh (the 454-record store
+backed up, then restored afterward once the attempt failed — no data
+lost) for a clean comparison. The run started cleanly — 0 rate-limit
+errors in the first ~7% of the log — then per-minute contention resumed,
+and then the Cerebras **daily** quota was hit outright. `kickoff_with_retry`
+retried twice against it (a cooldown can't fix a daily cap), got the
+identical error both times, and the script crashed with an unhandled
+exception before completing even kickoff #1 (12 agent steps / 30
+delegations in, already more delegation volume than the *entire* prior
+245-request kickoff #1) — let alone printing any stats. **No new
+before/after token/request numbers exist from this attempt.**
+
+**This crash is itself a finding, not just a blocker**: one pre-fix
+two-kickoff run followed by one partial post-fix attempt exhausted a full
+day's Cerebras quota without completing two clean test runs against a
+single company. A real multi-company due-diligence workflow needs to
+process many companies per day, repeatedly — this is a harder, more
+concrete constraint than any per-run token count in the tables above.
+
+**4. Production-viability verdict, as of this investigation: not viable
+as currently configured.** This isn't softened by the fact that Step 1's
+fix is real — the fix only addresses roughly the smaller share of memory's
+own call volume (recall side), the dominant share (save side) remains
+architecturally untouched by any `Memory(...)` config field, and the
+day's testing cadence itself — well short of real production
+throughput — already exhausted the account's daily capacity. Whatever
+Step 1 buys, it was never going to be enough by itself, and that was known
+from the source-level analysis before the re-run was even attempted.
+
+**Next levers, in the order they'd be tried:**
+
+1. **Decouple memory's LLM from the crew's** — a separate model (or
+   provider) for `Memory(llm=...)` specifically, so memory's substantial
+   request volume stops competing with the crew's own calls for the same
+   quota. **Implemented today, untested** — see below.
+2. **Override CrewAI's automatic save wiring.** `_save_to_memory()` always
+   calls `remember_many()` without pre-supplying scope/categories/
+   importance, forcing every save through the LLM-analysis path
+   (`analyze_for_save`) — there's no `Memory(...)` field that changes this;
+   fixing it means overriding CrewAI's internal save hook, a real code
+   change beyond config.
+3. **Drop memory from specialist agents, keep it only on the manager.**
+   CrewAI resolves memory per-agent (`agent.memory` overrides
+   `crew._memory`) — cross-kickoff company recall arguably only needs to
+   live at the manager level, not on all 4 specialists, and this is
+   achievable without forking CrewAI. **Implemented today, untested** —
+   see below.
+
+**Lever #1, implemented today (2026-08-06), untested pending tomorrow's
+quota reset**: `crew.py`'s new `_new_memory_llm()` builds
+`Memory(llm=...)` from `cerebras/gemma-4-31b` instead of the agents'
+`cerebras/gpt-oss-120b` — confirmed as a real, currently available model
+via a live `GET /v1/models` call (alongside `zai-glm-4.7`), and picked as
+the smallest of the three available models, since memory's own tasks
+(scope/category inference, consolidation decisions) are simple
+structured-output classification, not work that needs a 120B-parameter
+model. Cerebras' own rate-limit docs state limits apply at the
+organization level and "vary based on the model," listing separate
+RPM/TPM/TPH/TPD rows per model — consistent with independent per-model
+quota buckets, which is this lever's entire premise. **But the docs do not
+explicitly confirm whether one model's usage counts against another's
+limit**, and the only related test done so far (a second, different
+Cerebras API *key* on the same account hitting an identical daily-quota
+error) only proved sharing across *keys*, not across *models*. This is
+construct-checked only (`Memory` instantiates correctly, `mem.llm.model ==
+"gemma-4-31b"` while agents' LLMs stay on `"gpt-oss-120b"`) — **no live
+kickoff has run against it**. Tomorrow's re-run is also the first real
+test of whether separate models actually get separate quota on this
+account; report whichever outcome happens, don't assume the premise held
+just because it's plausible.
+
+**Lever #3, implemented today (2026-08-06), untested pending tomorrow's
+quota reset**: `crew.py` no longer passes `memory=` to `Crew(...)` at all —
+`Crew.memory` defaults to `False`, so its own `create_crew_memory()`
+(`@model_validator(mode="after")`, runs automatically) sets `crew._memory =
+None`. Each of the 4 specialist `Agent(...)` calls now also sets
+`memory=False` explicitly, for documentation of intent — but that alone
+does **not** exclude them from memory. Verified directly against
+`agents/agent_builder/base_agent.py`'s `resolve_memory()` (its own
+`@model_validator`): `elif self.memory is False: self.memory = None` — an
+explicit `False` and an unset field both normalize to the *identical*
+`None` before any other code ever looks at `agent.memory`. Every call site
+that actually decides whether an agent gets memory (`agent/core.py`'s
+`_retrieve_memory_context`, `base_agent_executor.py`'s `_save_to_memory`,
+`crew.py`'s own tool-preparation code) resolves it as `getattr(agent,
+"memory", None) or crew._memory` — so what *actually* keeps the
+specialists memory-free is that `crew._memory` is `None` for the whole
+crew, not their own `memory=False`. The `managing_partner` `Agent` gets
+`memory=self._new_memory()` — an explicit `Memory` instance, not `True` —
+specifically because `resolve_memory()` treats `True` as "build a default
+`Memory(llm=self.llm)`", which would have silently used the manager's own
+`gpt-oss-120b` and bypassed lever #1's decoupled `gemma-4-31b` entirely.
+Construct-checked: building the crew and inspecting the resulting `Agent`
+objects directly confirms all 4 specialists show `agent.memory is None`,
+the manager shows a real `Memory` instance running `gemma-4-31b` with
+`exploration_budget=0` / `query_analysis_threshold=100_000`, and
+`crew_obj._memory is None` — levers #1 and #3 compose correctly at the
+object level. **No live kickoff has run against it.**
+
+**Today's approach, explicitly**: findings written up same-day rather than
+waiting for tomorrow's quota reset (Option B), and levers #1 and #3
+implemented same-day so tomorrow's session can go straight to the real
+test instead of starting with more implementation work. **Combined test
+plan for tomorrow's quota reset**: one two-kickoff run (same shape as
+every prior M4 test — Brightledger full info, then a follow-up naming the
+company without re-supplying figures) validates three things at once,
+since all three are now in place together in the same `crew.py`:
+
+1. **Lever #1** — do the crew's `gpt-oss-120b` calls and memory's
+   `gemma-4-31b` calls exhaust their daily quotas independently, or does
+   one shared account-wide pool underneath the per-model numbers still tie
+   them together? (Open question per Cerebras' own docs, not yet answered
+   either way.)
+2. **Lever #3** — with memory now living only on the manager, does the
+   two-kickoff recall claim (kickoff #2 reproducing kickoff #1's specific
+   figures) still hold, given specialists no longer contribute their own
+   memory traffic at all? A cost fix that breaks recall isn't an
+   acceptable fix — recall correctness has to be re-confirmed, not
+   assumed to survive the change just because the mechanism is unchanged
+   for the manager itself.
+3. **Cost, overall** — fresh token/request/wall-clock numbers against all
+   three prior data points (75 req / 122K tokens; 245 req / 440K tokens;
+   the crashed attempt that never completed), to see whether combining all
+   three levers gets this into a genuinely production-viable range, or
+   merely a better-but-still-not-viable one.
+
+Real before/after numbers, and confirmation of whether recall still works
+correctly under the combined config, are deferred to that re-run.
+
+### Combined lever re-run (2026-08-07): live results
+
+Quota reset confirmed first via a single cheap 5-token direct API ping
+(200 OK, ~79 total tokens, no `429`) before spending anything real. The
+two-kickoff test then ran with a **shorter `company_info`** than the full
+Brightledger text used everywhere else in this document — same MRR
+figures ($42,000 current / $9,000 a year ago, so the recall check stays
+meaningful) but team composition, funding amount, and founder detail
+stripped out, specifically to cut agent-step count (and therefore
+memory-call volume) and conserve quota. **This means the numbers below are
+not a clean isolated test of levers #1/#3 alone** — the input shape
+changed at the same time the levers were turned on — flagged honestly
+throughout rather than presented as a controlled before/after.
+
+**Recall: MRR held, churn recall regressed to a real failure.** Kickoff
+#2 (follow-up query, MRR/churn figures withheld from its own input)
+reproduced kickoff #1's exact MRR figures verbatim:
+
+> "Core revenue numbers (provided): MRR $42,000 (ARR $504,000), rapid
+> growth from $9,000 to $42,000..."
+
+Neither `$42,000` nor `$9,000` appeared anywhere in kickoff #2's input —
+genuine recall, consistent with the original full-text test. But churn
+recall got *worse*, not just incomplete: kickoff #1's own memo explicitly
+captured "4% monthly churn" in three separate fields (financial_summary,
+risk_summary, key_red_flags), yet kickoff #2 flatly stated *"The pitch
+deck and available summary do NOT disclose monthly churn rate"* — a false
+denial, not a hedge. The original full-text test (Part A above) at least
+recalled churn *qualitatively* ("churn is high") even when it lost the
+number; here it's lost entirely. Kickoff #2 also lost all the
+pitch-deck-derived technical detail (AWS/Kubernetes/Postgres+Redis/SOC 2)
+that kickoff #1 had pulled via `PitchDeckReaderTool`. The likely
+mechanism: lever #3 means specialists no longer have their own memory, so
+cross-kickoff recall now depends entirely on what the **manager's own**
+memory captured and re-surfaces on its own — and it didn't re-surface
+churn or specialist tool-derived facts, even though the manager's own
+kickoff #1 output contained the churn figure. **A cost fix that narrows
+what gets recalled is a real regression, not a clean win** — reported as
+such rather than only counting the MRR success.
+
+**Cost: a large drop, but confounded, and only partially attributable to
+the levers.**
+
+| | mem requests | mem tokens | crew requests | crew tokens |
+|---|---|---|---|---|
+| Baseline (single kickoff, full text, pre-fix) | 75 | 122,362 | 22 | 111,197 |
+| Baseline (kickoff #1, full text, pre-fix) | 245 | 440,579 | 52 | 227,166 |
+| **New — kickoff #1 (short info, levers on)** | **12** | **18,789** | 14 | 48,986 |
+| New — kickoff #2 (follow-up, levers on) | 5 | 7,930 | 4 | 11,565 |
+
+Raw reduction is 84–96%, but that's not apples-to-apples — the input is
+shorter *and* both levers are on simultaneously, so the drop can't be
+cleanly attributed to either factor alone. A partially-normalizing
+metric, memory-requests-per-crew-request (which controls somewhat for
+fewer agent steps): baseline ranged 2.3x–4.7x; the new run is
+0.86x–1.25x. That's still a real ~2–4x drop even after normalizing for
+step count, which is consistent with lever #3 (specialists no longer
+touching memory at all) doing real work, not merely "shorter input →
+fewer steps → fewer everything." Wall-clock: 311.9s + 130.0s (+90s
+cooldown) = 531.9s total, versus 4,631.4s + 974.8s + 90s = 5,696.2s for
+the comparable full-text pre-fix pair — ~10x faster, but again confounded,
+since this run hit only 11 rate-limit events total versus 1,276 in the
+pre-fix run, itself mostly a symptom of much lower total request volume
+rather than proof the levers alone caused it.
+
+**Lever #1's open question (separate quota buckets per model?): real
+evidence, still not conclusive.** All 11 rate-limit failures in this run
+(7 "memory save analysis failed" + 4 "consolidation analysis failed")
+were tagged `crewai.memory.analyze` — i.e. all on the **gemma-4-31b**
+memory LLM specifically. Zero failures and zero `kickoff_with_retry`
+activations occurred on the crew's own **gpt-oss-120b** calls in the same
+time windows. That's consistent with separate per-model quota buckets
+(gemma hit its own ceiling while gpt-oss kept going unaffected) — but it
+is not proof: it's equally consistent with one shared account-wide pool
+where gpt-oss's calls simply didn't happen to push the shared total over
+the line during this particular run. Cerebras' docs still don't settle
+this either way; this is the first run to produce any direct evidence at
+all, and it points toward (not proves) separate buckets.
+
+**Verdict: still not production-viable as measured, for narrower reasons
+than before.** The memory-cost reduction is real but confounded with a
+shorter input, and buys a real regression in recall breadth (churn, and
+specialist tool-derived facts, no longer survive a kickoff boundary) in
+exchange for lower request volume. See "Final production-readiness
+verdict" near the end of this document for the concrete recommendation
+and cost-per-company figure this session's numbers support.
+
+### Custom memory layer (replacing CrewAI automatic memory)
+
+The 2026-08-07 combined-lever re-run's verdict — "still not
+production-viable" — was the actual trigger for this section: CrewAI's
+automatic per-agent-step `Memory` is now **fully retired project-wide**,
+replaced with a small hand-rolled layer (`custom_memory.py`) that reuses
+the same local storage/embedding infrastructure but drives it explicitly,
+once per `kickoff()`, instead of once per internal agent step.
+
+**Why retire it rather than tune it further.** Every lever tried against
+CrewAI's own `Memory` class (leaner recall config, a decoupled model,
+manager-only scoping) reduced cost without fixing the structural problem:
+its automatic hooks fire on every agent step by construction
+(`agent/core.py`'s `_retrieve_memory_context` before each step,
+`base_agent_executor.py`'s `_save_to_memory` after each step — see "Why
+memory costs so much" above), so cost scales with delegation count, not
+with how many facts actually need to persist. The save side — the
+dominant cost driver, confirmed at roughly 9-to-1 over the recall side —
+has no `Memory(...)` config field that touches it at all. And the
+cheapest configuration tried (levers #1+#3 together) still lost real
+facts (churn, specialist-tool-derived detail) between kickoffs. A
+mechanism that gets cheaper by getting less complete isn't fixable by
+tuning; it needed replacing.
+
+**Design.** `custom_memory.py` exposes two functions, both zero-LLM-call
+by construction:
+
+- **`save_memo(company_name: str, memo: InvestmentMemo) -> None`** — called
+  once, manually, after `kickoff()` completes. No extraction LLM call: the
+  crew's own `output_pydantic` already structured the facts, so this pulls
+  them straight from the typed `InvestmentMemo` fields
+  (`financial_summary`, `market_summary`, `technical_summary`,
+  `risk_summary`, `recommendation`, `confidence`, `key_red_flags`) and
+  writes them to LanceDB, keyed by `company_name`, alongside a combined-text
+  embedding computed locally via chromadb's bundled ONNX MiniLM-L6-v2
+  (`chromadb.utils.embedding_functions.ONNXMiniLM_L6_V2` — the same cached
+  model CrewAI's own retired `Memory` used, already downloaded, no network
+  call). A second save for the same `company_name` overwrites the prior
+  row (delete-then-add) rather than accumulating duplicates, so recall
+  always returns the latest assessment.
+- **`recall_memo(company_name: str) -> dict | None`** — called once,
+  manually, before a `kickoff()` if the caller wants prior context for a
+  named company. Exact metadata match on `company_name`, not a similarity
+  search: this is a per-company lookup where the caller already knows
+  which company it's asking about, not a general "find anything relevant"
+  query, so there's no LLM-driven query analysis or consolidation step to
+  run at all. Returns the structured fields as a plain `dict`, or `None`
+  if nothing's on file yet. (An embedding is still stored on save, for
+  potential future fuzzy lookup — not exercised by either function today.)
+
+**CrewAI's automatic memory is fully disabled**, not just de-emphasized:
+`crew.py` no longer builds a `Memory` instance anywhere — not for the crew
+(`Crew.memory` was already left at its `False` default), not for any of
+the 4 specialists (`memory=False`, unchanged), and, new as of 2026-08-07,
+not for the manager either (`managing_partner()` no longer passes
+`memory=` at all). `_new_memory()`, `_new_memory_llm()`, and
+`pop_memory_llm_usage()` — the machinery that built and reported on
+CrewAI's `Memory` — are deleted from `crew.py` entirely, not just unused.
+Construct-verified directly: `crew_obj._memory`, `crew_obj.manager_agent.memory`,
+and every specialist's `.memory` are all `None` after building a fresh
+`DealRoomCrew().crew()` — confirmed via a dry check, zero API calls.
+
+**`main.py` rewired accordingly.** Its two-kickoff pattern is unchanged in
+shape (full company info, then a follow-up query) but the recall mechanism
+underneath it is now deterministic, not automatic: before kickoff #1,
+`recall_memo("Brightledger")` checks for a prior record (normally `None`
+on a fresh store); after kickoff #1, `save_memo()` persists its memo; before
+kickoff #2, `recall_memo()` retrieves it and the result is rendered as a
+plain-text "prior assessment on file" block, prepended to the follow-up
+query's `company_info` input — an explicit string the crew reads like any
+other input, not framework-level memory. This changes what the recall
+check in `main.py` is actually testing: since the prior figures are now
+*literally present* in kickoff #2's own input text (deliberately, by
+design), their appearance in kickoff #2's output is no longer surprising
+evidence of retrieval — it's confirmation that the crew reads and uses
+context it's explicitly given, a much lower (and more reliable) bar than
+the old test's "did automatic memory retrieve a fact nobody re-stated."
+That's the intended trade: probabilistic, expensive, sometimes-incomplete
+automatic recall, swapped for deterministic, free, complete context
+injection. **`main.py`'s full two-kickoff flow itself was not re-run live
+this session** (out of scope for a cost-minimized verification pass) — it
+imports and constructs cleanly, but see the live check below for what
+*was* run.
+
+**Verification performed:**
+
+1. **Unit test, save/recall round-trip, zero LLM calls, zero API cost.** A
+   hand-built `InvestmentMemo` (never touched a real `kickoff()`) was
+   saved and recalled against an isolated temp LanceDB path. All fields
+   matched exactly; `recall_memo()` correctly returned `None` before any
+   save and for an unrelated company name; a second save for the same
+   company correctly overwrote (table row count stayed at 1) rather than
+   duplicating. All assertions passed.
+2. **Live check, one real kickoff, no second kickoff.** A single
+   `DealRoomCrew().crew().kickoff()` — memory fully disabled, no
+   monkeypatch needed post-refactor — ran on the same short
+   `company_info` used in the levers #1/#3 test (same MRR figures: $42,000
+   current / $9,000 a year prior). Cost: **23 requests, 100,819 tokens
+   (73,815 prompt + 27,004 completion), 498.3s wall-clock** — this is the
+   crew's own cost only; memory itself added **zero** additional requests
+   or tokens, confirmed directly (zero `crewai.memory.analyze` log lines
+   in the run, versus dozens in every pre-retirement run in this
+   document). The resulting real memo was saved via `save_memo()`, then
+   recalled via `recall_memo()` *without* a second kickoff, and every
+   field matched the saved memo exactly (`recalled_matches_saved_exactly:
+   true`) — confirmed on real crew output, not just the hand-built unit
+   test case.
+
+**Cost comparison, old vs. new, stated plainly:**
+
+| | Old (CrewAI automatic `Memory`, per kickoff) | New (`custom_memory.py`, per kickoff) |
+|---|---|---|
+| LLM calls for memory itself | 12–245, scaling with delegation count (see tables above) | **0**, always — no LLM call in `save_memo()` or `recall_memo()` by construction |
+| Tokens for memory itself | 7,930–440,579 | **0** |
+| Recall completeness | Partial even at best (MRR held, churn and specialist-tool facts lost under the leanest config) | Complete by construction — whatever's in the saved `InvestmentMemo`'s fields is exactly what `recall_memo()` returns, verified byte-for-byte in both the unit test and the live check |
+| Mechanism | Automatic, per-agent-step, LLM-mediated extraction/consolidation | Explicit, once-per-kickoff, direct field copy + local embedding |
+
+The expected production cost delta is the whole memory line item going to
+zero: a company reprocessed daily under the old (best-case, levers-on)
+config was paying at least ~12 extra requests per kickoff for
+bookkeeping; under the new layer it pays 0, unconditionally, with no
+config to tune and no completeness trade-off to weigh, because there's no
+LLM-mediated extraction step left to lose facts in. The only running cost
+this layer adds at all is the one-time ONNX embedding call inside
+`save_memo()` — local, on-device, no network call, not billed by
+Cerebras or anyone else.
 
 ### Part B: custom tools
 
@@ -601,38 +1256,72 @@ that script does it.
 Kickoff #1 above **is**, in substance, a live Part C run: the full M3
 hierarchical crew, memory enabled, both tools attached, on the standard
 `company_info` pitch — it just came from `main.py`'s Part A run rather
-than `verify_m4_integration.py`'s dedicated script. Results:
+than `verify_m4_integration.py`'s dedicated script. Results, from the
+completed re-run (`/tmp/m4_run_1786001117.log`):
 
 - **`output_pydantic` parsed correctly**: `recommendation: "needs more
   diligence"`, `confidence: "medium"`, a complete `InvestmentMemo`.
-- **Both custom tools invoked multiple times** — see Part B above.
+- **Both custom tools invoked multiple times**: `web_search` and
+  `read_pitch_deck` both fired repeatedly across the specialists — see Part
+  B above.
 - **Cost vs. M3 baseline** — see the table below.
 
 The dedicated `verify_m4_integration.py` script (event-bus-based tool
-tracking, explicit M3-baseline cost comparison) was written and its
-individual pieces smoke-tested, but was **not run end-to-end live**: the
-Cerebras account's daily quota was exhausted immediately after kickoff #1
-above, before this script got its turn. It's ready to run once quota
-resets: `PYTHONPATH=src python -m deal_room.verify_m4_integration`.
+tracking, explicit M3-baseline cost comparison) still hasn't been run
+end-to-end live — the two-kickoff `main.py` run above covers the same
+ground (memory, both tools, cost vs. baseline) via a different harness, so
+this isn't currently blocking anything, just not yet exercised itself:
+`PYTHONPATH=src python -m deal_room.verify_m4_integration`.
 
 ### Cost comparison: M2 → M3 → M4
 
-| | **M2 — sequential** | **M3 — hierarchical** | **M4 — hierarchical + memory + tools** |
-|---|---|---|---|
-| Tokens (normal pitch) | 60,580 | 94,920 | 111,197 (crew) + 122,362 (memory analysis, separate) = **233,559 total** |
-| Requests | 25 | 15 | 22 (crew) + 75 (memory analysis) = **97 total** |
-| Wall-clock | 63.6s | 444.4s | 1,589.0s |
-| vs. M3 baseline | — | — | **+146% tokens, +547% requests, +258% wall-clock** |
+| | **M2 — sequential** | **M3 — hierarchical** | **M4 (first, blocked-quota run)** | **M4 (completed re-run, kickoff #1 / #2)** | **M4 (2026-08-07, levers #1+#3, short input, kickoff #1 / #2)** |
+|---|---|---|---|---|---|
+| Tokens (normal pitch) | 60,580 | 94,920 | 111,197 (crew) + 122,362 (memory) = **233,559** | 227,166 + 440,579 = **667,745** / 61,055 + 74,019 = **135,074** | 48,986 + 18,789 = **67,775** / 11,565 + 7,930 = **19,495** |
+| Requests | 25 | 15 | 22 (crew) + 75 (memory) = **97** | 52 + 245 = **297** / 17 + 39 = **56** | 14 + 12 = **26** / 4 + 5 = **9** |
+| Wall-clock | 63.6s | 444.4s | 1,589.0s | 4,631.4s / 974.8s (+ 90s cooldown between) | 311.9s / 130.0s (+ 90s cooldown between) |
 
-The M4 row is a single run, same caveat as everywhere else in this
-document: directional, not a statistically robust sample. But the
-direction is unambiguous and large — memory's own LLM traffic alone
-(122,362 tokens / 75 requests) exceeds the entire M3 crew's per-run cost
-from the row above it. Tool calls (50 total between both tools) add
-further LLM round-trips on top of that, though their individual token
-contribution wasn't isolated separately from the crew's own 111,197.
+The last column is **not directly comparable** to the others on a
+per-token basis — it used a shorter `company_info` (same MRR figures, less
+surrounding detail) specifically to conserve quota, on top of the two
+levers. It's included because it's the only real, live number available
+for the combined-lever config, not because it isolates what the levers
+alone changed. See "Combined lever re-run (2026-08-07)" above for the
+normalized (per-crew-request) comparison that partially controls for the
+shorter input.
+
+The completed re-run's kickoff #1 cost roughly **3x** the first (blocked)
+run's figures — not because memory's mechanism changed, but because this
+run's manager delegated **36 times** across both kickoffs (vs. ~5 in a
+clean single M3/M4 run), plausibly itself a symptom of the heavy
+per-minute/per-hour rate-limit contention this run hit (1,276 total `429`s)
+degrading individual specialist answers enough that the manager re-queried
+more — memory cost scales with delegation count, not a fixed
+per-`kickoff()` tax. Both M4 rows remain single runs, same caveat as
+everywhere else in this document: real, directly measured, but not a
+statistically robust sample. See "Why memory costs so much, and a leaner
+option" above for what specifically drives memory's share of these
+numbers, and a proposed way to cut it.
 
 ### What blocked full verification, honestly
+
+**Update: no longer blocked.** The account-level daily quota exhaustion
+described below did resolve — confirmed first with a minimal, cheap direct
+API ping (a single 5-token completion, not a full kickoff), then with the
+full two-kickoff `main.py` re-run reported above, which completed
+end-to-end. The run did still hit heavy **per-minute and per-hour** rate
+limiting throughout (1,276 total `429`s across both kickoffs) — slow (kickoff
+#1 alone took 4,631s, roughly 3x the earlier successful single-kickoff
+run), but every individual failure recovered via CrewAI's and memory's own
+per-call fallback behavior (analysis calls default gracefully; the crew's
+own LLM calls retry internally) without the top-level `kickoff_with_retry()`
+cooldown ever needing to trigger, and without a single daily-quota `429` —
+confirming the earlier finding that the account-level daily cap is a
+distinct, harder limit from the per-minute/per-hour ones, and that this
+run stayed under it throughout.
+
+<details>
+<summary>Original (superseded) account of the blocking issue</summary>
 
 In order: a full day of M3 batch-testing (documented above) followed by
 M4's memory-heavy runs pushed the shared Cerebras API key past its
@@ -644,11 +1333,275 @@ per-key, so swapping keys didn't unblock anything. This is an external
 capacity constraint, not a bug surfaced in the memory/tools integration
 itself — every piece that *could* be verified cheaply and in isolation
 (the embedder, the analysis LLM, the storage persistence, both tools
-individually) was verified and works. What remains unverified live is
-specifically: kickoff #2's actual recall output, and
-`verify_m4_integration.py`'s own event-bus-based tool-tracking run. Both
-are ready to execute as soon as the account's daily quota resets — no
-code changes needed, just quota.
+individually) was verified and works.
+
+</details>
+
+## Milestone 5: CrewAI Flows (live-tested)
+
+Scaffolded same-day as the Milestone 4 memory-cost fix (2026-08-06), while
+Cerebras quota was exhausted — code-only, construct-checked at the time.
+**Live-tested 2026-08-07** (see "Live test results (2026-08-07)" below) —
+the router mechanics are confirmed correct against two real crew passes,
+and along the way, a real CrewAI `Flow` subclassing gotcha was discovered
+and worked around in the test harness (not a bug in `flow.py` itself).
+
+**What this milestone adds**: `flow.py`'s `DealRoomFlow` wraps the M3/M4
+hierarchical crew in a CrewAI `Flow`, adding a conditional second pass —
+`Process.hierarchical` already gives the *manager* runtime discretion over
+which specialists to consult; a `Flow` adds a layer of discretion *above*
+the crew itself, deciding whether to re-run the whole crew a second time
+based on the first pass's own output. Topology:
+
+```
+run_initial_analysis (@start)
+        |
+        v
+decide_deep_dive (@router — reads state.initial_memo)
+        |
+   +----+----+
+   |         |
+"deep_dive"  "skip_deep_dive"
+   |         |
+   v         v
+run_deep_dive   finalize_without_deep_dive
+(@listen)       (@listen)
+```
+
+The router's condition: `memo.confidence == "low" or memo.recommendation
+== "needs more diligence"` — reusing the crew's own `InvestmentMemo`
+fields (see `models.py`'s `Literal` constraints) rather than introducing a
+separate uncertainty judgment. A memo that failed to parse at all
+(`initial_memo is None` — a real, observed M3 failure mode, see "Milestone
+3 verification findings" above) routes to `skip_deep_dive` rather than
+crashing the flow: there's nothing to re-diligence against.
+
+**State schema** (`DealRoomFlowState`, in `flow.py`): `company_info`,
+`pitch_deck_path` (accepted but not yet wired to anything — see below),
+`initial_memo`, `deep_dive_triggered`, `final_memo`. `final_memo` is set to
+`initial_memo` by default at the end of the first pass and only
+overwritten if the deep-dive branch actually runs, so a caller reading
+`state.final_memo` after `kickoff()` always gets a real memo regardless of
+which branch executed, without having to check `deep_dive_triggered`
+first to know which field is valid. Subclasses CrewAI's own `FlowState`
+rather than a plain `pydantic.BaseModel` — this isn't a style choice:
+`Flow` validates on construction that its state model has an `id` field,
+and a plain `BaseModel` state fails with a real `pydantic.ValidationError`
+at instantiation — caught directly by construct-checking this class before
+ever attempting a live run, exactly the kind of thing construct-checking
+is for.
+
+**The deep-dive pass is a deliberate stub, not a finished design**: a
+second full `DealRoomCrew().crew().kickoff()` call, with one sentence
+appended to `company_info` stating the prior confidence/recommendation and
+asking for additional research. It does not yet feed the prior memo's
+specific red flags back in as targeted follow-up questions, add a longer
+research budget, or change which tools are available. This exists to make
+the branching logic and state schema real and testable now — the
+mechanism CrewAI provides for this to work at all was the point of this
+scaffolding pass, not the deep-dive prompt's content.
+
+**`pitch_deck_path` is accepted in the state schema but not wired to
+anything real yet.** The underlying M3/M4 crew's `PitchDeckReaderTool` is
+constructed with a hardcoded `default_file_path=str(SAMPLE_DECK_PATH)` per
+specialist agent in `crew.py`, not a path threaded through `Task` inputs
+the way `company_info` is. Making this field actually override which deck
+gets read is a real change to `crew.py`'s tool construction, out of scope
+for this scaffolding pass — flagged here rather than silently ignored.
+
+**Construct-checks performed, no live API calls**:
+- `DealRoomFlow()` instantiates without error; `flow.state` is a valid
+  `DealRoomFlowState` with an auto-generated `id`.
+- `crewai.flow.visualization.build_flow_structure(flow)` and
+  `flow.plot(show=False)` both render the topology above successfully —
+  4 nodes, `run_initial_analysis` correctly identified as the start
+  method, `decide_deep_dive` correctly identified as a router with
+  `trigger_methods: ['run_initial_analysis']`, and the two listeners
+  correctly matched to the router's `"deep_dive"` / `"skip_deep_dive"`
+  string returns (with an expected warning that dynamic router values
+  "may not be statically inferable" — accurate, since the actual branch
+  taken depends on a live memo's `confidence`/`recommendation`, not
+  something visualizable ahead of a real run).
+- `flow_main.py` imports cleanly without executing `run()`.
+
+### Live test results (2026-08-07)
+
+Two real `flow.kickoff()` runs — a deliberately strong/low-risk company
+pitch, and a deliberately weak/vague one — each triggering exactly one
+real first-pass crew kickoff. The deep-dive (second) pass was stubbed to
+avoid a second full crew kickoff per case: this test verifies the BRANCH
+decision and state-tracking, not the deep-dive payload's content (already
+exercised, unstubbed, in Milestone 4's own two-kickoff tests).
+
+**A real bug surfaced in the test harness first, not in `flow.py`.** The
+first attempt subclassed `DealRoomFlow`, overriding `run_deep_dive` to
+stub it:
+
+```python
+class Stubbed(DealRoomFlow):
+    def run_deep_dive(self):
+        ...
+```
+
+Both runs "completed" in 0.0s — no memo, no crew execution, no delegation
+logs at all. Traced directly into installed `crewai==1.15.9` source:
+`Flow`'s method discovery (`crewai/flow/dsl/_utils.py:_iter_flow_methods`)
+iterates only `flow_class.__dict__` — the class's **own** namespace, not
+inherited members (`for attr_name in flow_class.__dict__`, no MRO walk
+for regular `@start`/`@listen`/`@router` methods). A subclass overriding
+one method loses the *other three* (`run_initial_analysis`,
+`decide_deep_dive`, `finalize_without_deep_dive`) from its flow definition
+entirely, since those still live only in the parent class's `__dict__`.
+`_start_method_names()` then returned an empty list, so `kickoff()` had
+nothing to execute — a real, previously-undocumented CrewAI `Flow`
+subclassing gotcha, worth flagging for anyone else who tries to subclass
+a `Flow` to stub one step. **Fix**: monkey-patch the method directly on
+`DealRoomFlow` (re-decorated with the same `@listen("deep_dive")`),
+overwriting the same class-dict entry instead of shadowing it from a
+subclass:
+
+```python
+from crewai.flow.flow import listen
+
+@listen("deep_dive")
+def _stub_run_deep_dive(self):
+    self.state.deep_dive_triggered = True
+    self.state.final_memo = self.state.initial_memo
+    return self.state.final_memo
+
+DealRoomFlow.run_deep_dive = _stub_run_deep_dive
+```
+
+Verified via a dry construct-check (no live call) before spending quota
+again: `DealRoomFlow.flow_definition()` still found all 4 methods, with
+`run_initial_analysis` still correctly flagged as the start method.
+
+**Router mechanics: confirmed correct.** With the fix applied, both runs
+executed a real first-pass crew and the router correctly read
+`state.initial_memo`, applying its `confidence == "low" or recommendation
+== "needs more diligence"` condition — firing the deep-dive branch
+exactly when that condition held, both times, and correctly setting
+`state.deep_dive_triggered = True` with `state.final_memo` populated from
+the (stubbed) second pass.
+
+**The "strong input → skip deep dive" direction is unconfirmed against
+real output, for a specific and honest reason.** Both the strong and weak
+pitches came back `"needs more diligence"/"medium"`:
+
+| | deep_dive_triggered | recommendation / confidence | wall-clock |
+|---|---|---|---|
+| Strong input (profitable, 92% margin, <1% churn, SOC 2 Type II + ISO 27001, Fortune 500 contracts) | True (wanted False) | needs more diligence / medium | 450.9s |
+| Weak input (same shape as M3's vague-financials pitch) | True (wanted True) | needs more diligence / medium | 443.1s |
+
+Two contributing factors, both visible in the memo's own red flags, not
+speculation:
+
+1. This project's manager already has a well-documented bias toward
+   "needs more diligence" (see "Milestone 3 verification findings"
+   above) — not a new finding.
+2. A real methodology confound specific to this test: `PitchDeckReaderTool`
+   always reads the same hardcoded fictional Brightledger deck
+   (`default_file_path=str(SAMPLE_DECK_PATH)` in `crew.py`) regardless of
+   what `company_info` claims. The strong pitch's narrative claimed SOC 2
+   Type II; the fixed deck says Type I in progress — the model caught
+   this itself and flagged it as a red flag ("SOC 2 certification mismatch
+   (summary vs deck)"). The synthetic strong pitch was fighting the
+   tool's fixed content, not a clean test of "does a genuinely strong
+   company skip the deep dive."
+
+**Net**: the router's *logic* is confirmed correct (reads the real memo,
+applies its documented condition, sets state correctly) on two live
+passes. The `skip_deep_dive` code path itself is a trivial two-line
+`else` already exercised structurally by construct-checks
+(instantiation, state validation, `build_flow_structure()`/`plot()`
+visualization) — but it has not been exercised by a real memo in a live
+run, because neither test input actually produced one. Re-engineering a
+pitch (or decoupling the deck from `company_info`, itself now a good
+argument for finally wiring up `pitch_deck_path` — still not done, see
+above) to reliably produce a "pass"/high-confidence memo is out of scope
+for this verification-only session; this is reported as an honest gap,
+not papered over as "tested."
+
+## Final production-readiness verdict (2026-08-07)
+
+Written after the combined lever re-run (memory levers #1/#3, see
+Milestone 4) and the Flow branching test (Milestone 5) both completed
+live against a fresh Cerebras quota reset.
+
+**Is CrewAI's built-in memory viable for a production multi-company
+workflow with levers #1 and #3 applied?** No, not as measured — but for
+narrower, better-understood reasons than the original "not viable"
+verdict. The two levers together produced a real, large reduction in
+memory-request volume (245→12 requests, 440,579→18,789 tokens for a
+comparable first pass — see "Combined lever re-run" above for the honest
+caveats on attribution), and the core recall claim this whole milestone
+was built to test — MRR figures surviving a `kickoff()` boundary without
+being re-supplied — still holds verbatim. But the cost fix bought that
+reduction at the price of a genuine regression: churn recall went from
+*incomplete* (qualitatively right, number wrong) to *actively wrong*
+(explicitly denies the figure was ever disclosed), and all
+specialist-tool-derived knowledge (web search findings, pitch-deck
+details) stopped surviving between kickoffs at all, because lever #3
+removes memory from every agent except the manager. A recall mechanism
+that gets cheaper by getting less complete isn't a clean win for a
+due-diligence tool, where the whole point is not losing facts across a
+multi-session review of the same company.
+
+**Recommendation**: for this project's actual use case — repeated,
+multi-session diligence on the same company where specific figures must
+survive verbatim — **the custom memory layer already flagged as the
+fallback (LanceDB storage + your own recall/save, called once per
+`kickoff()` instead of per-agent-step) remains the better architecture**,
+not because CrewAI's unified memory is broken, but because its automatic
+per-agent-step save/recall hooks are structurally the wrong granularity
+for this workflow: they multiply LLM calls with agent-step count
+(delegation count, specifically) rather than with "how many facts
+actually need to persist," and there's no `Memory(...)` config field that
+changes that — confirmed directly from `crewai` 1.15.9 source in "Why
+memory costs so much" above, not assumed. A hand-rolled layer called once
+per `kickoff()` sidesteps the per-step multiplication entirely, at the
+cost of writing your own extraction/consolidation logic instead of
+getting it for free.
+
+**Update (2026-08-07, later the same day): this recommendation is now
+implemented, not just proposed.** See "Custom memory layer (replacing
+CrewAI automatic memory)" above — `custom_memory.py`'s `save_memo()`/
+`recall_memo()` replace CrewAI's `Memory` entirely (fully disabled in
+`crew.py`, not just tuned further), verified via a zero-cost unit test
+and one live kickoff with an exact save→recall field match. The memory
+line item in the cost-per-company figure below now drops to zero going
+forward — the 87,270-token figure measured under the old (levers-on)
+config no longer applies to future runs.
+
+**Cost-per-company, concrete figure from this session's actual
+measurements**: treating one "company processed" as an initial pass plus
+one realistic follow-up query (this test's own shape), the combined-lever
+run cost **87,270 total tokens** (48,986 + 18,789 crew+memory for
+kickoff #1, plus 11,565 + 7,930 for kickoff #2 — 35 total requests) and
+**531.9s wall-clock** (including a
+90s inter-kickoff cooldown). That is a real, directly-measured number
+from a live run, not an estimate — but it is **not** a clean per-company
+production estimate on its own, for two reasons stated plainly: (1) it
+used a shorter `company_info` than a real pitch would likely be, and (2)
+it reflects a single run, not a statistically robust sample (the same
+caveat that applies to every other cost figure in this document). Treat
+it as "this is what one company cost, this one time, under this
+specific config" — a real data point to plan against, not a guaranteed
+per-company budget. Cerebras' current per-token pricing isn't in CrewAI's
+built-in cost table for this model; check
+https://cloud.cerebras.ai/pricing and multiply against the token counts
+above for an actual dollar figure.
+
+**Milestone 5's Flow branching**: the router mechanism itself is
+confirmed correct on live crew output (reads the real memo, applies its
+documented condition, sets state accordingly) — safe to build on. The
+"skip the deep dive" path remains structurally verified but not
+exercised by a real memo, an honest gap rather than a defect (see
+Milestone 5's "Live test results" above for why). The deep-dive pass
+itself is still a deliberate stub (one appended sentence, not targeted
+follow-up questions derived from the first pass's specific red flags) —
+unchanged by this session's testing, which deliberately avoided spending
+quota on the stub's payload.
 
 ## Running it
 
@@ -696,15 +1649,20 @@ code changes needed, just quota.
    As of Milestone 4, this runs the hierarchical crew **twice** in the
    same process: once against a hardcoded fictional startup pitch, then
    again on a follow-up question about the same company that doesn't
-   re-supply its figures — checking whether CrewAI's memory recalls them
-   (see Milestone 4's Part A above for why that second call's result
-   isn't guaranteed and needs to be read from the actual output, not
-   assumed). Each `Task` still prints the final `InvestmentMemo` plus
-   execution stats (wall-clock time, token usage, and memory's own
-   separately-tracked LLM usage) — to see *how* the Managing Partner got
-   there (which specialists it consulted, in what order, any re-queries,
-   any tool calls), pipe stdout to a log file, since delegation and tool
-   calls only show up in the verbose trace:
+   re-supply its figures in the question text itself. As of 2026-08-07,
+   recall between the two calls is handled by `custom_memory.py`, not
+   CrewAI's (now fully disabled) automatic memory: `main.py` explicitly
+   recalls the first call's saved memo and injects it as plain-text prior
+   context ahead of the follow-up query, then checks whether the second
+   call's own output actually uses that context rather than ignoring it
+   and hedging (see Milestone 4's "Custom memory layer" section above for
+   why this is a different, more reliable check than the original
+   automatic-memory version). Each `Task` still prints the final
+   `InvestmentMemo` plus execution stats (wall-clock time, token usage) —
+   to see *how* the Managing Partner got there (which specialists it
+   consulted, in what order, any re-queries, any tool calls), pipe stdout
+   to a log file, since delegation and tool calls only show up in the
+   verbose trace:
 
    ```bash
    PYTHONPATH=src python -m deal_room.main 2>&1 | tee /tmp/m4_run.log
@@ -833,14 +1791,51 @@ save/recall behavior.
   Managing Partner becomes the crew's `manager_agent` and dynamically
   delegates to the 4 specialists via a single open-ended task, rather than
   running a fixed final task over pre-computed outputs.
-- **Milestone 4** ✅ (this one, partially verified live — see its section
-  above): CrewAI unified memory (local ONNX embeddings + a dedicated
-  Cerebras analysis LLM, no OpenAI dependency) plus two custom tools
-  (`WebSearchTool`, `PitchDeckReaderTool`). Tools are fully verified live
-  with real invocation counts and evidence in the final output. Memory's
-  mechanism is verified in isolation; the full two-kickoff recall claim
-  and the dedicated integration script are written and ready but blocked
-  on a real Cerebras account-level daily quota exhaustion, not a defect.
-- **Milestone 5**: wrap the crew in a CrewAI `Flow` for more control over
-  branching, state, and multi-step orchestration beyond a single
-  `kickoff()` call.
+- **Milestone 4** ✅ (functionally verified live; CrewAI's own unified
+  memory was flagged **not production-viable as measured** across every
+  configuration tried, and is now **retired project-wide as of
+  2026-08-07**, replaced by a hand-rolled `custom_memory.py` — see "Custom
+  memory layer (replacing CrewAI automatic memory)" and "Final
+  production-readiness verdict" above): CrewAI unified memory (local ONNX
+  embeddings + a dedicated Cerebras analysis LLM, no OpenAI dependency)
+  plus two custom tools (`WebSearchTool`, `PitchDeckReaderTool`). Tools are fully verified
+  live with real invocation counts and evidence in the final output. The
+  two-kickoff recall claim is verified live twice now — once with the
+  full company text (kickoff #2 reproduced kickoff #1's exact MRR figures,
+  with some real but incomplete recall of other figures), and again on
+  2026-08-07 with levers #1 (decoupled memory LLM) and #3 (manager-only
+  memory scoping) applied together, where MRR recall still held verbatim
+  but churn recall regressed from incomplete to actively wrong, and
+  specialist-tool-derived facts stopped surviving `kickoff()` boundaries
+  entirely. Memory-request volume dropped sharply under the combined
+  levers (245→12 requests for a comparable first pass), though not as a
+  clean isolated test of the levers alone — see "Combined lever re-run
+  (2026-08-07)" above for the full numbers and honest caveats. The
+  quota-bucket question (does memory's separate model draw from an
+  independent rate-limit pool?) now has real, suggestive-but-not-conclusive
+  evidence: every rate-limit failure in the combined re-run hit the memory
+  LLM specifically, none hit the crew's own model. That same day, CrewAI's
+  `Memory` was retired entirely rather than tuned further — `custom_memory.py`
+  now handles cross-kickoff recall via explicit `save_memo()`/`recall_memo()`
+  calls (LanceDB + local ONNX embeddings, zero LLM calls), verified via a
+  zero-cost unit test and one live kickoff with an exact save→recall field
+  match; `main.py` is rewired to use it. `verify_m4_integration.py`
+  remains optional, unrun.
+- **Milestone 5** ✅ (live-tested 2026-08-07 — see its section above):
+  wraps the crew in a CrewAI `Flow` (`flow.py`'s `DealRoomFlow`) for a
+  layer of control above the crew itself — a conditional second ("deep
+  dive") pass, triggered when the first pass's own
+  `InvestmentMemo.confidence` is low or its `recommendation` is "needs
+  more diligence". The `Flow` class, its `FlowState`-based state schema,
+  and the router/listener topology were construct-verified first
+  (instantiation, state validation, structural visualization via
+  `build_flow_structure()`/`plot()`), then live-tested against two real
+  crew passes: the router correctly read a live memo and fired the
+  deep-dive branch when its condition held (confirmed on both a strong
+  and a weak test input — both happened to trigger it; see above for why
+  the "strong input skips the deep dive" direction remains structurally
+  verified but not yet confirmed against a real non-triggering memo). A
+  real CrewAI `Flow` subclassing gotcha was discovered and documented
+  along the way: `Flow` method discovery only scans a class's own
+  `__dict__`, not inherited members, so naively subclassing to override
+  one step silently drops the others from the flow definition.

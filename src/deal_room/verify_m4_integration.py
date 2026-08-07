@@ -63,7 +63,6 @@ def run():
 
     memo = result.pydantic
     usage = result.token_usage
-    memory_usage = deal_room_crew.pop_memory_llm_usage()
     specialist_calls = deal_room_crew.pop_specialist_calls()
 
     print("\n" + "=" * 70)
@@ -104,16 +103,12 @@ def run():
     token_delta = usage.total_tokens - M3_BASELINE_TOKENS
     token_pct = (token_delta / M3_BASELINE_TOKENS) * 100
     print(f"\nToken delta vs. M3 baseline: {token_delta:+,d} ({token_pct:+.1f}%)")
-    if memory_usage is not None:
-        print(
-            f"Memory analysis LLM (separate instance, NOT in the totals "
-            f"above): {memory_usage.total_tokens} tokens / "
-            f"{memory_usage.successful_requests} requests"
-        )
-        print(
-            f"True total cost including memory overhead: "
-            f"{usage.total_tokens + memory_usage.total_tokens:,d} tokens"
-        )
+    print(
+        "CrewAI's automatic per-agent-step memory is disabled project-wide "
+        "as of 2026-08-07 (see custom_memory.py) -- no separate memory-LLM "
+        "overhead to report here anymore; `usage.total_tokens` above is the "
+        "whole cost of this run."
+    )
 
 
 if __name__ == "__main__":
